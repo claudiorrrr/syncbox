@@ -1,5 +1,6 @@
-# Rust
-/src-tauri/target/
+# Rust — workspace builds into the root target/, but a stale src-tauri/target/
+# can linger from the pre-workspace layout, so ignore it anywhere.
+target/
 
 # Node
 /node_modules/
@@ -23,4 +24,4 @@
 *.key
 
 # Build-time default pair-server host — personal, kept out of the repo.
-/src-tauri/pair-server.txt
+/pair-server.txt

@@ -1,15 +1,10 @@
 //! syncbox — simple Mac folder sync, built on iroh.
-
-mod config;
-mod conflict;
-mod ignore_patterns;
-mod peer;
-mod sync;
+//!
+//! This crate is just the macOS menu-bar front-end. The sync engine lives
+//! in `syncbox-core` and is shared with the headless CLI.
 
 use anyhow::Result;
-use ignore_patterns::IgnoreSet;
 use iroh_docs::{api::Doc, AuthorId, DocTicket, NamespaceId};
-use peer::Node;
 use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet},
@@ -17,7 +12,10 @@ use std::{
     str::FromStr,
     sync::{atomic::AtomicU32, Arc},
 };
-use sync::{EchoGuard, LogHandle, PeerMap, StatsHandle, StatusLine, SyncState};
+use syncbox_core::ignore_patterns::IgnoreSet;
+use syncbox_core::peer::Node;
+use syncbox_core::sync::{EchoGuard, LogHandle, PeerMap, StatsHandle, StatusLine, SyncState};
+use syncbox_core::{config, pair, peer, sync};
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -736,18 +734,7 @@ async fn cmd_start_sync(app: AppHandle) -> Result<bool, String> {
     maybe_start_sync(&app).await.map_err(|e| e.to_string())
 }
 
-// ---------- Short-code pairing (rendezvous via Cloudflare Worker) ----------
-
-#[derive(serde::Deserialize)]
-struct CodeResponse {
-    code: String,
-    expires: u64,
-}
-
-#[derive(serde::Deserialize)]
-struct TicketResponse {
-    ticket: String,
-}
+// ---------- Short-code pairing (rendezvous server) ----------
 
 #[derive(Debug, Serialize, Clone)]
 struct PairCodeView {
@@ -755,24 +742,10 @@ struct PairCodeView {
     expires_unix: u64,
 }
 
-/// Resolve the pair-server URL. Precedence, highest first:
-///   1. `SYNCBOX_PAIR_SERVER` environment variable
-///   2. the `pair_server_url` saved in config.json (the Advanced UI field)
-///   3. the placeholder `DEFAULT_PAIR_SERVER`
+/// Resolve the pair-server URL from config. Thin wrapper around
+/// [`pair::resolve_server`] (env var > config.json > built-in default).
 fn pair_server_url(cfg: &config::Config) -> String {
-    std::env::var("SYNCBOX_PAIR_SERVER")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            cfg.pair_server_url
-                .as_deref()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-        })
-        .unwrap_or_else(|| config::DEFAULT_PAIR_SERVER.to_string())
-        .trim_end_matches('/')
-        .to_string()
+    pair::resolve_server(cfg.pair_server_url.as_deref())
 }
 
 #[tauri::command]
@@ -820,25 +793,12 @@ async fn cmd_make_code(
     // sync task. Without it, the code-issuing device never publishes files.
     let _ = maybe_start_sync(&app).await;
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let res = client
-        .post(format!("{server}/pair"))
-        .json(&serde_json::json!({ "ticket": ticket_str }))
-        .send()
+    let pc = pair::create_code(&server, &ticket_str)
         .await
-        .map_err(|e| format!("pair server unreachable: {e}"))?;
-    if !res.status().is_success() {
-        let status = res.status();
-        let body = res.text().await.unwrap_or_default();
-        return Err(format!("pair server {status}: {body}"));
-    }
-    let parsed: CodeResponse = res.json().await.map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?;
     Ok(PairCodeView {
-        code: parsed.code,
-        expires_unix: parsed.expires,
+        code: pc.code,
+        expires_unix: pc.expires_unix,
     })
 }
 
@@ -848,42 +808,14 @@ async fn cmd_use_code(
     state: State<'_, AppState>,
     code: String,
 ) -> Result<(), String> {
-    let normalized = code
-        .trim()
-        .to_uppercase()
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .collect::<String>();
-    if normalized.len() != 6 {
-        return Err("code must be 6 characters".into());
-    }
-    let display = format!("{}-{}", &normalized[..3], &normalized[3..]);
-
     let server = {
         let inner = state.inner.lock().await;
         pair_server_url(&inner.config)
     };
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let res = client
-        .get(format!("{server}/pair/{display}"))
-        .send()
+    let ticket = pair::redeem_code(&server, &code)
         .await
-        .map_err(|e| format!("pair server unreachable: {e}"))?;
-    if res.status() == reqwest::StatusCode::NOT_FOUND {
-        return Err("code not found or expired".into());
-    }
-    if !res.status().is_success() {
-        let status = res.status();
-        let body = res.text().await.unwrap_or_default();
-        return Err(format!("pair server {status}: {body}"));
-    }
-    let parsed: TicketResponse = res.json().await.map_err(|e| e.to_string())?;
-
-    cmd_join_with_ticket(app, state, parsed.ticket).await
+        .map_err(|e| e.to_string())?;
+    cmd_join_with_ticket(app, state, ticket).await
 }
 
 // ---------- Misc commands ----------

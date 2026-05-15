@@ -1,0 +1,29 @@
+# Sample systemd unit for the syncbox headless client.
+#
+# Install as a *user* service — syncbox stores its data under
+# ~/.local/share/dev.syncbox, so it should run as your login user, not root.
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp syncbox.service ~/.config/systemd/user/
+#   # adjust ExecStart below to wherever the `syncbox` binary lives
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now syncbox
+#
+# Let it keep running after you log out:
+#   sudo loginctl enable-linger "$USER"
+#
+# Pair the device first (one-time):  syncbox init ~/Sync && syncbox join CODE
+
+[Unit]
+Description=syncbox folder sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/syncbox run
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

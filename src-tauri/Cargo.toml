@@ -1,10 +1,10 @@
 [package]
 name = "syncbox"
-version = "0.1.0"
 description = "Simple Mac folder sync over iroh"
 authors = ["syncbox"]
-edition = "2021"
-rust-version = "1.77"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 
 [lib]
 name = "syncbox_lib"
@@ -14,48 +14,28 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+# the shared sync engine
+syncbox-core = { workspace = true }
+
+# GUI shell
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-autostart = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 
-# iroh stack — pinned to compatible pre-release set
-iroh = "=1.0.0-rc.0"
-iroh-blobs = "0.101"
-iroh-docs = "0.99"
-iroh-gossip = "0.99"
-
-# file watching
-notify = "8"
-notify-debouncer-full = "0.7"
+# the few engine types the commands touch directly
+iroh = { workspace = true }
+iroh-docs = { workspace = true }
 
 # async + utility
-tokio = { version = "1", features = ["full"] }
-futures-lite = "2"
-anyhow = "1"
-thiserror = "2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-bytes = "1"
-
-# misc
-dirs = "5"
-hostname = "0.4"
-blake3 = "1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-hex = "0.4"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-ignore = "0.4"
-walkdir = "2"
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+walkdir = { workspace = true }
 
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
-
-[profile.release]
-panic = "abort"
-codegen-units = 1
-lto = true
-opt-level = "s"
-strip = true

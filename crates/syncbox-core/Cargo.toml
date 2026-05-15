@@ -1,0 +1,32 @@
+[package]
+name = "syncbox-core"
+description = "syncbox sync engine — iroh-backed folder sync, no UI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "syncbox_core"
+
+[dependencies]
+iroh = { workspace = true }
+iroh-blobs = { workspace = true }
+iroh-docs = { workspace = true }
+iroh-gossip = { workspace = true }
+notify = { workspace = true }
+notify-debouncer-full = { workspace = true }
+tokio = { workspace = true }
+futures-lite = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+dirs = { workspace = true }
+hostname = { workspace = true }
+blake3 = { workspace = true }
+hex = { workspace = true }
+tracing = { workspace = true }
+reqwest = { workspace = true }
+ignore = { workspace = true }
+walkdir = { workspace = true }

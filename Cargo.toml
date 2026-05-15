@@ -1,0 +1,56 @@
+# Workspace root.
+#
+# Three members:
+#   crates/syncbox-core — the sync engine (no UI, no platform deps)
+#   crates/syncbox-cli  — headless command-line client
+#   src-tauri           — the macOS menu-bar GUI
+[workspace]
+resolver = "2"
+members = ["crates/syncbox-core", "crates/syncbox-cli", "src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+
+[workspace.dependencies]
+# iroh stack — pinned to a compatible pre-release set
+iroh = "=1.0.0-rc.0"
+iroh-blobs = "0.101"
+iroh-docs = "0.99"
+iroh-gossip = "0.99"
+
+# filesystem watching
+notify = "8"
+notify-debouncer-full = "0.7"
+
+# async + utility
+tokio = { version = "1", features = ["full"] }
+futures-lite = "2"
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = "1"
+
+# misc
+dirs = "5"
+hostname = "0.4"
+blake3 = "1"
+hex = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+ignore = "0.4"
+walkdir = "2"
+clap = { version = "4", features = ["derive"] }
+
+# the shared engine
+syncbox-core = { path = "crates/syncbox-core" }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
