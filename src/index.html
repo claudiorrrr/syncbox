@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>syncbox</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>syncbox</h1>
+        <p class="muted" id="hostname">this device</p>
+      </header>
+
+      <section class="card">
+        <h2>1. Folder</h2>
+        <p class="muted">Pick one folder. Everything inside it syncs to paired devices.</p>
+        <div class="row">
+          <code id="folder-path" class="path">(not set)</code>
+          <button id="btn-choose-folder">Choose folder…</button>
+        </div>
+        <button class="link" id="btn-open-folder" hidden>Reveal in Finder</button>
+      </section>
+
+      <section class="card">
+        <h2>2. Pair</h2>
+        <p class="muted">
+          On the first device, click <em>Get code</em>. Read the 6 characters
+          to the second device and tap <em>Use code</em>.
+        </p>
+
+        <div class="code-display">
+          <span id="our-code" class="code">— — —</span>
+          <span id="code-expiry" class="muted small"></span>
+        </div>
+        <div class="row">
+          <button id="btn-make-code">Get code</button>
+          <button id="btn-copy-code">Copy</button>
+        </div>
+        <label class="checkbox">
+          <input type="checkbox" id="ticket-read-only" />
+          <span>Issue read-only code (the other device receives but never writes back)</span>
+        </label>
+
+        <hr />
+
+        <label class="block">
+          <span>Have a code from another device?</span>
+          <input id="join-code" type="text" maxlength="7" placeholder="ABC-123" autocapitalize="characters" />
+        </label>
+        <button id="btn-use-code">Use code</button>
+        <p id="pair-result" class="pair-result"></p>
+
+        <details class="advanced">
+          <summary>Advanced: paste raw ticket</summary>
+          <label class="block">
+            <span>This device's ticket</span>
+            <textarea id="our-ticket" readonly placeholder="Click below"></textarea>
+          </label>
+          <div class="row">
+            <button id="btn-make-ticket">Show ticket</button>
+            <button id="btn-copy-ticket">Copy</button>
+          </div>
+          <label class="block">
+            <span>Join another device</span>
+            <textarea id="join-ticket" placeholder="Paste ticket here"></textarea>
+          </label>
+          <button id="btn-join">Join</button>
+
+          <hr />
+
+          <label class="block">
+            <span>Pair server URL</span>
+            <input id="pair-server" type="text" placeholder="https://syncbox-pair.you.workers.dev" />
+          </label>
+          <button id="btn-save-pair-server">Save server URL</button>
+        </details>
+      </section>
+
+      <section class="card">
+        <h2>3. Run</h2>
+        <p>
+          Status: <strong id="status-text">checking…</strong>
+        </p>
+        <p class="muted small">
+          Peers: <span id="peer-count">0 / 0 online</span>
+        </p>
+        <ul id="peer-list" class="peers"></ul>
+        <p class="muted small">
+          Storage used: <span id="storage-size">—</span>
+        </p>
+        <p class="muted small">
+          Download: <span id="xfer-rate">idle</span>
+        </p>
+        <label class="checkbox">
+          <input type="checkbox" id="autostart" />
+          <span>Launch syncbox at login</span>
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" id="read-only-local" />
+          <span>This device is read-only (don't push local changes)</span>
+        </label>
+        <div class="row">
+          <button id="btn-write-ignore" class="link">
+            Create .syncboxignore in folder
+          </button>
+        </div>
+      </section>
+
+      <section class="card">
+        <details>
+          <summary>Debug log</summary>
+          <pre id="debug-log" class="debug-log">(no activity yet)</pre>
+          <button id="btn-copy-log" class="link">Copy log</button>
+        </details>
+      </section>
+
+      <footer class="muted small">
+        Files conflict copy is preserved as
+        <code>name.conflict-&lt;host&gt;-&lt;timestamp&gt;.ext</code>.
+      </footer>
+    </main>
+
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

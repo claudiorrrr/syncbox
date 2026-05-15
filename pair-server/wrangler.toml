@@ -1,0 +1,18 @@
+name = "syncbox-pair"
+main = "src/worker.ts"
+compatibility_date = "2026-05-01"
+
+# Serve the worker at your own domain. Replace pair.DOMAIN.COM with the host
+# you want. `custom_domain = true` makes wrangler create the DNS record and
+# TLS cert automatically on deploy — the zone must be in the same Cloudflare
+# account you `wrangler login` with.
+routes = [
+  { pattern = "pair.DOMAIN.COM", custom_domain = true }
+]
+
+[[kv_namespaces]]
+binding = "PAIR"
+id = "19d3d020ef3a427c9d61d76237d0b75e"
+
+[observability]
+enabled = true

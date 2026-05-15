@@ -1,0 +1,26 @@
+# Rust
+/src-tauri/target/
+
+# Node
+/node_modules/
+/dist/
+
+# Tauri build artifacts
+/src-tauri/gen/
+/src-tauri/WixTools/
+
+# macOS
+.DS_Store
+
+# Local data
+*.log
+
+# Secrets — never commit. Nothing in this project needs one today, but if a
+# future feature does, this keeps it out of git by default.
+.env
+.env.*
+*.pem
+*.key
+
+# Build-time default pair-server host — personal, kept out of the repo.
+/src-tauri/pair-server.txt
