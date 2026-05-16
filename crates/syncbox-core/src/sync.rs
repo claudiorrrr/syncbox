@@ -3,17 +3,18 @@
 //! Model — deliberately simple so iroh does the heavy lifting:
 //!
 //! * The user picks one folder. Its absolute path is the *root*.
-//! * Each file is one doc entry: `key = relative/path`, `value = file bytes`.
-//! * `value` is content-addressed by iroh-blobs; iroh-docs syncs the entry
-//!   *and* downloads its content to every peer automatically. We never run
-//!   the blob downloader ourselves.
-//! * Local edits → `doc.set_bytes`. Remote edits arrive as `ContentReady`;
-//!   we then mirror the doc onto disk.
+//! * Each file is one doc entry: `key = relative/path`, content addressed
+//!   by iroh-blobs. iroh-docs syncs the entry *and* downloads its content
+//!   to every peer automatically — we never run the blob downloader.
+//! * Local edits → `doc.import_file`; remote edits land via `ContentReady`
+//!   and we mirror the doc onto disk. Content is streamed both ways, so
+//!   memory use stays constant regardless of file size.
 //! * Conflict policy is last-write-wins. If a local file is newer than the
 //!   incoming entry, the incoming copy is kept as
-//!   `<name>.conflict-<author>-<ts>.<ext>` — nothing is destroyed.
-//! * Deletes are tombstones (`doc.del`). An incoming tombstone moves the
-//!   local file to `<name>.deleted-<ts>.<ext>`.
+//!   `<name>.conflict-<host>-<ts>.<ext>` — nothing is destroyed.
+//! * Deletes are tombstones (`doc.del`). An incoming tombstone removes the
+//!   local file, unless the local copy was edited after the delete was
+//!   issued — then the edit wins and is re-published.
 
 use crate::{conflict, ignore_patterns::IgnoreSet, peer::Node};
 use anyhow::{bail, Context, Result};
@@ -112,9 +113,9 @@ pub struct SyncState {
     pub host: String,
     pub echo: EchoGuard,
     pub peers: PeerMap,
-    /// Sink for fresh peer addresses; lib.rs persists them to config so the
-    /// next restart can call `doc.start_sync` directly instead of waiting
-    /// on discovery.
+    /// Sink for fresh peer addresses; the front-end (GUI or CLI) persists
+    /// them to config so the next restart can call `doc.start_sync` directly
+    /// instead of waiting on discovery.
     pub addr_sink: tokio::sync::mpsc::UnboundedSender<EndpointAddr>,
     /// Gitignore-style filter loaded from `.syncboxignore` + builtins.
     pub ignores: Arc<IgnoreSet>,
@@ -123,7 +124,8 @@ pub struct SyncState {
     /// Endpoint IDs (hex form, matches `PublicKey::to_string()`) we refuse
     /// to apply changes from. Used by the "revoke device" feature.
     pub blocked: Arc<Mutex<std::collections::HashSet<String>>>,
-    /// Counter of in-flight transfers. The tray uses it to render a badge.
+    /// Counter of in-flight transfers. The tray reads it to show the
+    /// "syncing" icon state.
     pub active: Arc<std::sync::atomic::AtomicU32>,
     /// Rolling throughput, surfaced to the UI.
     pub stats: StatsHandle,
@@ -446,9 +448,7 @@ async fn handle_event(state: &SyncState, ev: LiveEvent) -> bool {
             }
             if entry.is_empty() {
                 // Tombstone — apply immediately, no content to wait for.
-                if let Err(e) =
-                    apply_remote_delete(state, entry.key(), entry.timestamp()).await
-                {
+                if let Err(e) = apply_remote_delete(state, entry.key(), entry.timestamp()).await {
                     tracing::warn!(error = ?e, "apply_remote_delete failed");
                 }
                 false
@@ -546,7 +546,14 @@ async fn write_entry_to_disk(state: &SyncState, entry: &Entry) -> Result<bool> {
 
     // Content must already be local. iroh-docs downloads it on its own; if
     // it isn't here yet, bail and let a later ContentReady retry.
-    if !state.node.store.blobs().has(content_hash).await.unwrap_or(false) {
+    if !state
+        .node
+        .store
+        .blobs()
+        .has(content_hash)
+        .await
+        .unwrap_or(false)
+    {
         return Ok(false);
     }
 
@@ -588,7 +595,9 @@ async fn write_entry_to_disk(state: &SyncState, entry: &Entry) -> Result<bool> {
         .context("export_file from doc")?
         .await
         .context("export_file from doc")?;
-    tokio::fs::rename(&tmp, &write_to).await.context("rename temp")?;
+    tokio::fs::rename(&tmp, &write_to)
+        .await
+        .context("rename temp")?;
 
     {
         let mut guard = state.echo.lock().await;
@@ -679,8 +688,8 @@ async fn hash_file(path: &Path) -> Result<Hash> {
     Ok(Hash::from_bytes(*hasher.finalize().as_bytes()))
 }
 
-/// RAII bump of the in-flight transfer counter; the tray reads it to draw a
-/// "syncing" badge.
+/// RAII bump of the in-flight transfer counter; the tray reads it to show
+/// the "syncing" icon state.
 struct ActiveGuard<'a> {
     counter: &'a std::sync::atomic::AtomicU32,
 }
@@ -694,7 +703,8 @@ impl<'a> ActiveGuard<'a> {
 
 impl Drop for ActiveGuard<'_> {
     fn drop(&mut self) {
-        self.counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.counter
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -702,10 +712,11 @@ fn should_skip(rel: &Path, ignores: &IgnoreSet, is_dir: bool) -> bool {
     if rel.as_os_str().is_empty() {
         return true;
     }
-    if rel
-        .components()
-        .any(|c| c.as_os_str().to_string_lossy().ends_with(".syncbox-partial"))
-    {
+    if rel.components().any(|c| {
+        c.as_os_str()
+            .to_string_lossy()
+            .ends_with(".syncbox-partial")
+    }) {
         return true;
     }
     ignores.is_ignored(rel, is_dir)

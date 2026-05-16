@@ -27,9 +27,9 @@ pub struct Node {
 
 impl Node {
     pub async fn spawn(iroh_root: &Path) -> Result<Self> {
-        // QUIC endpoint with n0 defaults: public relays, automatic NAT
-        // traversal, and (because we asked for the feature in Cargo.toml)
-        // local mDNS discovery for same-LAN peers.
+        // QUIC endpoint with n0 defaults: public relays and automatic NAT
+        // traversal. No local mDNS — same-LAN peers still rendezvous through
+        // a relay and node-id discovery.
         let endpoint = Endpoint::bind(presets::N0)
             .await
             .context("failed to bind iroh endpoint")?;

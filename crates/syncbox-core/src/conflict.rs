@@ -18,7 +18,13 @@ pub fn conflict_path(original: &Path, host: &str) -> PathBuf {
 
     let safe_host: String = host
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
 
     let new_name = match ext {

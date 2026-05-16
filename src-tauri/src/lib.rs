@@ -21,7 +21,7 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Manager, State,
 };
-use tauri_plugin_autostart::{ManagerExt, MacosLauncher};
+use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_dialog::DialogExt;
 use tokio::sync::{watch, Mutex};
 
@@ -127,8 +127,7 @@ pub fn run() {
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_millis() as u64)
                             .unwrap_or(0);
-                        s.last_update_ms != 0
-                            && now.saturating_sub(s.last_update_ms) < 2000
+                        s.last_update_ms != 0 && now.saturating_sub(s.last_update_ms) < 2000
                     };
                     drop(inner);
 
@@ -374,7 +373,13 @@ async fn bootstrap(app: &AppHandle) -> Result<()> {
 
 fn build_tray(app: AppHandle) -> Result<()> {
     let pair_item = MenuItem::with_id(&app, "pair", "Pair / Status…", true, None::<&str>)?;
-    let open_item = MenuItem::with_id(&app, "open_folder", "Open synced folder", true, None::<&str>)?;
+    let open_item = MenuItem::with_id(
+        &app,
+        "open_folder",
+        "Open synced folder",
+        true,
+        None::<&str>,
+    )?;
     let sep = PredefinedMenuItem::separator(&app)?;
     let quit_item = MenuItem::with_id(&app, "quit", "Quit syncbox", true, None::<&str>)?;
     let menu = Menu::with_items(&app, &[&pair_item, &open_item, &sep, &quit_item])?;
@@ -489,8 +494,7 @@ async fn maybe_start_sync(app: &AppHandle) -> Result<bool> {
 
     // Channel that sync.rs uses to publish freshly-seen peer addresses; the
     // consumer below dedupes them into the persistent config.
-    let (addr_tx, mut addr_rx) =
-        tokio::sync::mpsc::unbounded_channel::<iroh::EndpointAddr>();
+    let (addr_tx, mut addr_rx) = tokio::sync::mpsc::unbounded_channel::<iroh::EndpointAddr>();
 
     let st = SyncState {
         node,
@@ -557,7 +561,11 @@ async fn cmd_get_status(state: State<'_, AppState>) -> Result<StatusView, String
     };
     let message = inner.status.lock().await.clone();
     Ok(StatusView {
-        folder: inner.config.folder.as_ref().map(|p| p.display().to_string()),
+        folder: inner
+            .config
+            .folder
+            .as_ref()
+            .map(|p| p.display().to_string()),
         hostname: inner.config.hostname.clone(),
         has_doc: inner.doc.is_some(),
         has_ticket: inner.config.doc_ticket.is_some(),
@@ -592,7 +600,11 @@ async fn cmd_get_peers(state: State<'_, AppState>) -> Result<Vec<PeerView>, Stri
             last_seen_unix: e.last_seen_unix,
         })
         .collect();
-    out.sort_by(|a, b| b.online.cmp(&a.online).then(b.last_seen_unix.cmp(&a.last_seen_unix)));
+    out.sort_by(|a, b| {
+        b.online
+            .cmp(&a.online)
+            .then(b.last_seen_unix.cmp(&a.last_seen_unix))
+    });
     Ok(out)
 }
 
@@ -618,7 +630,9 @@ async fn cmd_get_ticket(
 
         inner.config.doc_ticket = Some(s.clone());
         inner.config.namespace_id = Some(doc.id().to_string());
-        config::save(&inner.config).await.map_err(|e| e.to_string())?;
+        config::save(&inner.config)
+            .await
+            .map_err(|e| e.to_string())?;
         s
     };
 
@@ -648,7 +662,9 @@ async fn cmd_join_with_ticket(
         inner.config.namespace_id = Some(doc.id().to_string());
         inner.config.doc_ticket = Some(ticket.trim().to_string());
         inner.doc = Some(doc);
-        config::save(&inner.config).await.map_err(|e| e.to_string())?;
+        config::save(&inner.config)
+            .await
+            .map_err(|e| e.to_string())?;
         sync::log_line(&inner.log, "paired: joined shared folder, connecting…").await;
     }
     let started = maybe_start_sync(&app).await.unwrap_or(false);
@@ -686,17 +702,16 @@ async fn cmd_choose_folder(
             Ok(s) => inner.ignores = Some(Arc::new(s)),
             Err(e) => tracing::warn!(error = ?e, "could not load ignore set"),
         }
-        config::save(&inner.config).await.map_err(|e| e.to_string())?;
+        config::save(&inner.config)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     let _ = maybe_start_sync(&app).await;
     Ok(Some(pb.display().to_string()))
 }
 
 #[tauri::command]
-async fn cmd_open_folder(
-    app: AppHandle,
-    _state: State<'_, AppState>,
-) -> Result<(), String> {
+async fn cmd_open_folder(app: AppHandle, _state: State<'_, AppState>) -> Result<(), String> {
     cmd_open_folder_inner(&app).await.map_err(|e| e.to_string())
 }
 
@@ -755,13 +770,14 @@ async fn cmd_get_pair_server(state: State<'_, AppState>) -> Result<String, Strin
 }
 
 #[tauri::command]
-async fn cmd_set_pair_server(
-    state: State<'_, AppState>,
-    url: String,
-) -> Result<(), String> {
+async fn cmd_set_pair_server(state: State<'_, AppState>, url: String) -> Result<(), String> {
     let trimmed = url.trim().to_string();
     let mut inner = state.inner.lock().await;
-    inner.config.pair_server_url = if trimmed.is_empty() { None } else { Some(trimmed) };
+    inner.config.pair_server_url = if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    };
     config::save(&inner.config).await.map_err(|e| e.to_string())
 }
 
@@ -785,7 +801,9 @@ async fn cmd_make_code(
         let s = ticket.to_string();
         inner.config.namespace_id = Some(doc.id().to_string());
         inner.config.doc_ticket = Some(s.clone());
-        config::save(&inner.config).await.map_err(|e| e.to_string())?;
+        config::save(&inner.config)
+            .await
+            .map_err(|e| e.to_string())?;
         (pair_server_url(&inner.config), s)
     };
 
@@ -852,7 +870,9 @@ async fn cmd_block_peer(state: State<'_, AppState>, id: String) -> Result<(), St
     }
     if !inner.config.blocked_peers.contains(&id) {
         inner.config.blocked_peers.push(id);
-        config::save(&inner.config).await.map_err(|e| e.to_string())?;
+        config::save(&inner.config)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -866,7 +886,9 @@ async fn cmd_unblock_peer(state: State<'_, AppState>, id: String) -> Result<(), 
         blocked.remove(&id);
     }
     inner.config.blocked_peers.retain(|x| x != &id);
-    config::save(&inner.config).await.map_err(|e| e.to_string())?;
+    config::save(&inner.config)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -888,7 +910,9 @@ async fn cmd_set_read_only(
             return Ok(());
         }
         inner.config.read_only_local = enabled;
-        config::save(&inner.config).await.map_err(|e| e.to_string())?;
+        config::save(&inner.config)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     // Restart sync so the new value takes effect.
     restart_sync(&app).await.map_err(|e| e.to_string())?;
@@ -921,7 +945,9 @@ async fn cmd_write_default_ignore(state: State<'_, AppState>) -> Result<bool, St
                 # Built-in defaults already cover common cases (.git, node_modules,\n\
                 # .DS_Store, target/, .venv, *.swp, *.tmp). Add your own below.\n\
                 \n";
-    tokio::fs::write(&p, body).await.map_err(|e| e.to_string())?;
+    tokio::fs::write(&p, body)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(true)
 }
 
@@ -932,9 +958,7 @@ async fn restart_sync(app: &AppHandle) -> Result<()> {
 }
 
 #[tauri::command]
-async fn cmd_get_transfer_stats(
-    state: State<'_, AppState>,
-) -> Result<sync::TransferStats, String> {
+async fn cmd_get_transfer_stats(state: State<'_, AppState>) -> Result<sync::TransferStats, String> {
     let inner = state.inner.lock().await;
     let mut s = inner.stats.lock().await.clone();
     // Decay a stale rate: if nothing landed in the last ~3s, call it idle.

@@ -29,7 +29,11 @@ use syncbox_core::{
 use tokio::sync::{watch, Mutex};
 
 #[derive(Parser)]
-#[command(name = "syncbox", version, about = "Folder sync over iroh — headless client")]
+#[command(
+    name = "syncbox",
+    version,
+    about = "Folder sync over iroh — headless client"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -132,8 +136,8 @@ async fn do_join(code: String) -> Result<()> {
         .context("redeem pairing code")?;
 
     let node = spawn_node().await?;
-    let ticket = DocTicket::from_str(ticket_str.trim())
-        .context("pair server returned an invalid ticket")?;
+    let ticket =
+        DocTicket::from_str(ticket_str.trim()).context("pair server returned an invalid ticket")?;
     let doc = node.docs.import(ticket).await.context("import doc")?;
 
     cfg.namespace_id = Some(doc.id().to_string());
@@ -190,8 +194,7 @@ async fn run_sync() -> Result<()> {
     }
 
     let ignores = Arc::new(IgnoreSet::load(&folder).context("load ignore set")?);
-    let (addr_tx, mut addr_rx) =
-        tokio::sync::mpsc::unbounded_channel::<iroh::EndpointAddr>();
+    let (addr_tx, mut addr_rx) = tokio::sync::mpsc::unbounded_channel::<iroh::EndpointAddr>();
 
     let st = SyncState {
         node: node.clone(),
