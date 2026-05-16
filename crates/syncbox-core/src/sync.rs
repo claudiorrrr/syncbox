@@ -20,8 +20,11 @@ use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use futures_lite::StreamExt;
 use iroh::EndpointAddr;
-use iroh_blobs::Hash;
-use iroh_docs::{api::Doc, engine::LiveEvent, store::Query, AuthorId};
+use iroh_blobs::{
+    api::blobs::{ExportMode, ImportMode},
+    Hash,
+};
+use iroh_docs::{api::Doc, engine::LiveEvent, store::Query, AuthorId, Entry};
 use notify::{EventKind, RecursiveMode};
 use notify_debouncer_full::new_debouncer;
 use serde::Serialize;
@@ -313,7 +316,8 @@ async fn handle_local_change(state: &SyncState, path: &Path) -> Result<()> {
 }
 
 /// Publish a single file to the doc. Skips ignored paths, echoes of our own
-/// writes, and content already present in the doc.
+/// writes, and content already present in the doc. The file is streamed into
+/// the blob store, so memory use is constant regardless of file size.
 async fn upload_file(state: &SyncState, path: &Path) -> Result<()> {
     let rel = match path.strip_prefix(&state.root) {
         Ok(r) => r.to_path_buf(),
@@ -324,8 +328,10 @@ async fn upload_file(state: &SyncState, path: &Path) -> Result<()> {
     }
     let key = rel_to_key(&rel);
 
-    let bytes = tokio::fs::read(path).await?;
-    let want = Hash::new(&bytes);
+    // Hash the file with constant memory to decide whether it's worth
+    // publishing. This is a separate read from the import below, but it lets
+    // us skip the (more expensive) import entirely for echoes and no-ops.
+    let want = hash_file(path).await?;
 
     // Echo guard: if the file already matches what we wrote applying a
     // remote change, this event is our own footprint — skip.
@@ -346,18 +352,22 @@ async fn upload_file(state: &SyncState, path: &Path) -> Result<()> {
     }
 
     let _busy = ActiveGuard::new(&state.active);
-    let n = bytes.len() as u64;
-    state
+    // import_file streams the file into the blob store and sets the doc
+    // entry in one step. ImportMode::Copy (never TryReference): the blob
+    // store must own its bytes, since this file stays live and mutable.
+    let outcome = state
         .doc
-        .set_bytes(state.author, key, Bytes::from(bytes))
+        .import_file(&state.node.store, state.author, key, path, ImportMode::Copy)
         .await
-        .context("set_bytes on doc")?;
+        .context("import_file into doc")?
+        .await
+        .context("import_file into doc")?;
 
     {
         let mut s = state.stats.lock().await;
-        s.up_total = s.up_total.saturating_add(n);
+        s.up_total = s.up_total.saturating_add(outcome.size);
     }
-    tracing::info!(path = %rel.display(), bytes = n, "published local change");
+    tracing::info!(path = %rel.display(), bytes = outcome.size, "published local change");
     set_status(state, format!("sent {}", rel.display())).await;
     Ok(())
 }
@@ -510,9 +520,7 @@ async fn reconcile_remote(state: &SyncState) -> Result<()> {
             }
             continue;
         }
-        match write_entry_to_disk(state, entry.key(), entry.content_hash(), entry.timestamp())
-            .await
-        {
+        match write_entry_to_disk(state, &entry).await {
             Ok(true) => wrote += 1,
             Ok(false) => {}
             Err(e) => tracing::warn!(error = ?e, "reconcile write failed"),
@@ -526,18 +534,15 @@ async fn reconcile_remote(state: &SyncState) -> Result<()> {
 
 /// Write one doc entry to disk. Returns Ok(true) if a file was written,
 /// Ok(false) if nothing needed doing (content not local yet, or disk already
-/// matches).
-async fn write_entry_to_disk(
-    state: &SyncState,
-    key: &[u8],
-    content_hash: Hash,
-    entry_ts_micros: u64,
-) -> Result<bool> {
-    let rel = key_to_rel(key)?;
+/// matches). The blob is streamed to disk, so memory use is constant
+/// regardless of file size.
+async fn write_entry_to_disk(state: &SyncState, entry: &Entry) -> Result<bool> {
+    let rel = key_to_rel(entry.key())?;
     if should_skip(&rel, &state.ignores, false) {
         return Ok(false);
     }
     let abs = state.root.join(&rel);
+    let content_hash = entry.content_hash();
 
     // Content must already be local. iroh-docs downloads it on its own; if
     // it isn't here yet, bail and let a later ContentReady retry.
@@ -545,24 +550,18 @@ async fn write_entry_to_disk(
         return Ok(false);
     }
 
-    // Disk already matches the doc? Nothing to do.
-    if let Ok(local) = tokio::fs::read(&abs).await {
-        if Hash::new(&local) == content_hash {
+    // Disk already matches the doc? Nothing to do. Hashed with constant
+    // memory; errors (e.g. file missing) just fall through to the write.
+    if let Ok(local) = hash_file(&abs).await {
+        if local == content_hash {
             return Ok(false);
         }
     }
 
     let _busy = ActiveGuard::new(&state.active);
-    let bytes = state
-        .node
-        .store
-        .blobs()
-        .get_bytes(content_hash)
-        .await
-        .context("get_bytes")?;
 
     // Last-write-wins. entry timestamps are unix microseconds.
-    let entry_ms = entry_ts_micros / 1000;
+    let entry_ms = entry.timestamp() / 1000;
     let local_mtime = match tokio::fs::metadata(&abs).await {
         Ok(m) => Some(mtime_unix_ms(&m)),
         Err(_) => None,
@@ -578,9 +577,17 @@ async fn write_entry_to_disk(
     if let Some(parent) = write_to.parent() {
         tokio::fs::create_dir_all(parent).await.ok();
     }
-    // Atomic write: temp file + rename.
+    // Atomic write: stream the blob into a temp file, then rename. Clear any
+    // stale temp file left by a previous interrupted write first.
     let tmp = with_partial_ext(&write_to);
-    tokio::fs::write(&tmp, &bytes).await.context("write temp")?;
+    tokio::fs::remove_file(&tmp).await.ok();
+    let size = state
+        .doc
+        .export_file(&state.node.store, entry.clone(), &tmp, ExportMode::Copy)
+        .await
+        .context("export_file from doc")?
+        .await
+        .context("export_file from doc")?;
     tokio::fs::rename(&tmp, &write_to).await.context("rename temp")?;
 
     {
@@ -589,7 +596,7 @@ async fn write_entry_to_disk(
     }
     {
         let mut s = state.stats.lock().await;
-        let n = bytes.len() as u64;
+        let n = size;
         let now = now_unix_ms();
         let dt = (now.saturating_sub(s.last_update_ms)) as f64 / 1000.0;
         if dt > 0.0 && s.last_update_ms != 0 {
@@ -652,6 +659,24 @@ fn with_partial_ext(p: &Path) -> PathBuf {
         .unwrap_or_else(|| "tmp".into());
     name.push_str(".syncbox-partial");
     p.with_file_name(name)
+}
+
+/// BLAKE3-hash a file with constant memory (chunked read). iroh-blobs hashes
+/// a raw blob the same way, so the result compares directly against doc entry
+/// content hashes.
+async fn hash_file(path: &Path) -> Result<Hash> {
+    use tokio::io::AsyncReadExt;
+    let mut f = tokio::fs::File::open(path).await?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(Hash::from_bytes(*hasher.finalize().as_bytes()))
 }
 
 /// RAII bump of the in-flight transfer counter; the tray reads it to draw a
