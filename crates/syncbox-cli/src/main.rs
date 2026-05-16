@@ -166,14 +166,26 @@ async fn run_sync() -> Result<()> {
         .await?
         .context("not paired — run `syncbox pair` or `syncbox join` first")?;
 
-    // Re-establish sync with peers we knew before the last restart, so the
-    // first connection doesn't have to wait for fresh discovery.
-    if !cfg.known_peers.is_empty() {
-        let peers = cfg.known_peers.clone();
+    // Tell iroh-docs who to sync with. `open_doc` attaches the local replica
+    // via `open`, which — unlike `import` — does not start a sync session, so
+    // this step is what actually connects us. Two address sources: peers seen
+    // in earlier sessions (known_peers) and the nodes embedded in the pairing
+    // ticket (the only source right after a fresh `join`).
+    let mut peers = cfg.known_peers.clone();
+    if let Some(t) = &cfg.doc_ticket {
+        if let Ok(ticket) = DocTicket::from_str(t) {
+            for addr in ticket.nodes {
+                if !peers.iter().any(|p| p.id == addr.id) {
+                    peers.push(addr);
+                }
+            }
+        }
+    }
+    if !peers.is_empty() {
         let n = peers.len();
         match doc.start_sync(peers).await {
-            Ok(()) => tracing::info!(count = n, "rejoined known peers"),
-            Err(e) => tracing::warn!(error = ?e, "start_sync with known peers failed"),
+            Ok(()) => tracing::info!(count = n, "started sync with peers"),
+            Err(e) => tracing::warn!(error = ?e, "start_sync failed"),
         }
     }
 
