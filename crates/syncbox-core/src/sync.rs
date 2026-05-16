@@ -442,7 +442,7 @@ async fn scan_local(state: &SyncState) -> Result<()> {
 /// True if the event was content-related and a reconcile should be scheduled.
 async fn handle_event(state: &SyncState, ev: LiveEvent) -> bool {
     match ev {
-        LiveEvent::InsertRemote { from, entry, .. } => {
+        LiveEvent::InsertRemote { from, .. } => {
             {
                 let blocked = state.blocked.lock().await;
                 if blocked.contains(&from.to_string()) {
@@ -450,16 +450,11 @@ async fn handle_event(state: &SyncState, ev: LiveEvent) -> bool {
                     return false;
                 }
             }
-            if entry.is_empty() {
-                // Tombstone — apply immediately, no content to wait for.
-                if let Err(e) = apply_remote_delete(state, entry.key(), entry.timestamp()).await {
-                    tracing::warn!(error = ?e, "apply_remote_delete failed");
-                }
-                false
-            } else {
-                // Content will arrive via ContentReady; reconcile then.
-                true
-            }
+            // Content entry or tombstone — let the debounced reconcile apply
+            // it. reconcile_remote walks single_latest_per_key, so it always
+            // acts on the CRDT's winning entry: a stale tombstone can't delete
+            // a newer edit, nor a stale edit resurrect a deleted file.
+            true
         }
         LiveEvent::ContentReady { .. } => true,
         LiveEvent::PendingContentReady => true,
@@ -519,7 +514,7 @@ async fn reconcile_remote(state: &SyncState) -> Result<()> {
         };
         if entry.is_empty() {
             // Tombstone — make sure the file is gone locally.
-            if let Err(e) = apply_remote_delete(state, entry.key(), entry.timestamp()).await {
+            if let Err(e) = apply_remote_delete(state, entry.key()).await {
                 tracing::warn!(error = ?e, "reconcile delete failed");
             }
             continue;
@@ -628,28 +623,24 @@ async fn write_entry_to_disk(state: &SyncState, entry: &Entry) -> Result<bool> {
     Ok(true)
 }
 
-/// React to a tombstone. A delete on one device removes the file on every
-/// device. The one exception: if the local copy was modified *after* the
-/// deletion was issued, the edit wins (last-write-wins) and we re-publish it
-/// instead of deleting.
-async fn apply_remote_delete(state: &SyncState, key: &[u8], entry_ts: u64) -> Result<()> {
+/// React to a tombstone: a delete on one device removes the file everywhere.
+///
+/// This runs only when the tombstone is the latest entry for its key — i.e.
+/// iroh-docs' CRDT has already decided the delete wins over any concurrent
+/// edit. We trust that decision and remove the file. We do *not* compare
+/// mtimes to second-guess it: a received file's mtime is its local write
+/// time, not the content's logical age, so that comparison wrongly judged
+/// freshly-synced files "newer than the delete" and resurrected them.
+async fn apply_remote_delete(state: &SyncState, key: &[u8]) -> Result<()> {
     let rel = key_to_rel(key)?;
     if should_skip(&rel, &state.ignores, false) {
         return Ok(());
     }
     let abs = state.root.join(&rel);
 
-    let local_meta = match tokio::fs::metadata(&abs).await {
-        Ok(m) => m,
-        Err(_) => return Ok(()), // already gone
-    };
-    if !local_meta.is_file() {
-        return Ok(());
-    }
-
-    if mtime_unix_ms(&local_meta) > entry_ts / 1000 {
-        tracing::info!(path = %rel.display(), "tombstone older than local copy — re-uploading");
-        return handle_local_change(state, &abs).await;
+    match tokio::fs::metadata(&abs).await {
+        Ok(m) if m.is_file() => {}
+        _ => return Ok(()), // already gone, or not a regular file
     }
 
     // Mark the path so the watcher swallows the Remove event our own
@@ -659,9 +650,28 @@ async fn apply_remote_delete(state: &SyncState, key: &[u8], entry_ts: u64) -> Re
         guard.insert(abs.clone(), EchoMark::Deleted);
     }
     tokio::fs::remove_file(&abs).await?;
+    prune_empty_dirs(&state.root, &abs).await;
     tracing::info!(path = %rel.display(), "applied remote delete");
     set_status(state, format!("removed {}", rel.display())).await;
     Ok(())
+}
+
+/// After removing `removed`, delete any parent directories it left empty,
+/// climbing toward `root`. Stops at `root` (never removed) or the first
+/// non-empty directory. Without this a remotely-deleted folder lingers as an
+/// empty husk on the receiving device.
+async fn prune_empty_dirs(root: &Path, removed: &Path) {
+    let mut dir = removed.parent();
+    while let Some(d) = dir {
+        if d == root || !d.starts_with(root) {
+            break;
+        }
+        // remove_dir only succeeds on an empty directory.
+        if tokio::fs::remove_dir(d).await.is_err() {
+            break;
+        }
+        dir = d.parent();
+    }
 }
 
 // ---------- helpers ----------
