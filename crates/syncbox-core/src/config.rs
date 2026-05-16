@@ -55,9 +55,18 @@ impl Config {
     }
 }
 
+/// Root directory for syncbox's own state — `config.json` plus the iroh blob
+/// and doc stores. Defaults to the platform data directory; the
+/// `SYNCBOX_DATA_DIR` env var overrides it, which lets several isolated
+/// instances run on one machine (handy for testing).
 pub fn data_dir() -> Result<PathBuf> {
-    let base = dirs::data_dir().context("could not locate user data directory")?;
-    let dir = base.join("dev.syncbox");
+    let dir = match std::env::var("SYNCBOX_DATA_DIR") {
+        Ok(s) if !s.trim().is_empty() => PathBuf::from(s.trim()),
+        _ => {
+            let base = dirs::data_dir().context("could not locate user data directory")?;
+            base.join("dev.syncbox")
+        }
+    };
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
