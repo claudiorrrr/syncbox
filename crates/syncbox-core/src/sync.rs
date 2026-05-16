@@ -78,6 +78,9 @@ pub struct TransferStats {
     pub down_rate: f64,
     /// Wall-clock of the last rate update, unix milliseconds.
     pub last_update_ms: u64,
+    /// Wall-clock of the last byte moved in *either* direction, unix ms.
+    /// The tray reads this to animate the "syncing" icon.
+    pub last_activity_ms: u64,
 }
 
 pub type StatsHandle = Arc<Mutex<TransferStats>>;
@@ -368,6 +371,7 @@ async fn upload_file(state: &SyncState, path: &Path) -> Result<()> {
     {
         let mut s = state.stats.lock().await;
         s.up_total = s.up_total.saturating_add(outcome.size);
+        s.last_activity_ms = now_unix_ms();
     }
     tracing::info!(path = %rel.display(), bytes = outcome.size, "published local change");
     set_status(state, format!("sent {}", rel.display())).await;
@@ -618,6 +622,7 @@ async fn write_entry_to_disk(state: &SyncState, entry: &Entry) -> Result<bool> {
         }
         s.down_total = s.down_total.saturating_add(n);
         s.last_update_ms = now;
+        s.last_activity_ms = now;
     }
     tracing::info!(path = %write_to.display(), "wrote remote file");
     Ok(true)

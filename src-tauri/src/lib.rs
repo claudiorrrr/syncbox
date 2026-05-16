@@ -105,43 +105,50 @@ pub fn run() {
                 }
             });
 
-            // Tray updater: swaps the icon between not-setup / syncing /
-            // in-sync. No text badge — the icon shape carries the state.
+            // Tray updater: NotSetup (gray ring), Syncing (blue disc with a
+            // rotating comet), InSync (green check). Ticks fast so the
+            // Syncing comet animates smoothly.
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let mut last_state: Option<TrayState> = None;
+                let mut frame: u32 = 0;
                 loop {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                     let state: State<AppState> = handle.state();
                     let inner = state.inner.lock().await;
                     let n = inner.active.load(std::sync::atomic::Ordering::Relaxed);
                     let configured = inner.doc.is_some()
                         && inner.config.folder.is_some()
                         && inner.sync_handle.is_some();
-                    // "Syncing" requires both a non-zero in-flight count AND
-                    // recent throughput. The recency check means a leaked
-                    // counter can't pin the icon blue forever.
+                    // Recent movement in *either* direction. last_activity_ms
+                    // is bumped on every upload and download; the 1200 ms
+                    // window keeps the animation visible after brief bursts.
                     let recent = {
                         let s = inner.stats.lock().await;
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_millis() as u64)
                             .unwrap_or(0);
-                        s.last_update_ms != 0 && now.saturating_sub(s.last_update_ms) < 2000
+                        s.last_activity_ms != 0
+                            && now.saturating_sub(s.last_activity_ms) < 1200
                     };
                     drop(inner);
 
                     let tray_state = if !configured {
                         TrayState::NotSetup
-                    } else if n > 0 && recent {
+                    } else if n > 0 || recent {
                         TrayState::Syncing
                     } else {
                         TrayState::InSync
                     };
 
-                    if last_state != Some(tray_state) {
+                    // Redraw on a state change, and every tick while syncing
+                    // so the comet keeps moving.
+                    let redraw = last_state != Some(tray_state)
+                        || tray_state == TrayState::Syncing;
+                    if redraw {
                         if let Some(tray) = handle.tray_by_id("main") {
-                            let (rgba, w, h) = status_icon(tray_state);
+                            let (rgba, w, h) = status_icon(tray_state, frame);
                             let img = tauri::image::Image::new_owned(rgba, w, h);
                             let _ = tray.set_icon(Some(img));
                             let _ = tray.set_icon_as_template(false);
@@ -149,6 +156,7 @@ pub fn run() {
                         }
                         last_state = Some(tray_state);
                     }
+                    frame = frame.wrapping_add(1);
                 }
             });
 
@@ -214,11 +222,12 @@ fn dist_to_seg(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
 }
 
 /// Render the status icon as raw RGBA. Returns `(rgba, width, height)`.
-/// Three deliberately distinct shapes so the state reads at a glance:
+/// `frame` advances the Syncing animation and is ignored by the other states:
 ///   * NotSetup — a hollow gray ring
-///   * Syncing  — a solid blue disc
+///   * Syncing  — a blue disc with a white comet sweeping the rim
 ///   * InSync   — a solid green disc with a white check mark
-fn status_icon(state: TrayState) -> (Vec<u8>, u32, u32) {
+fn status_icon(state: TrayState, frame: u32) -> (Vec<u8>, u32, u32) {
+    use std::f32::consts::TAU;
     const S: i32 = 32;
     let c = S as f32 / 2.0;
     let radius = 12.0;
@@ -229,11 +238,17 @@ fn status_icon(state: TrayState) -> (Vec<u8>, u32, u32) {
     };
     let mut buf = vec![0u8; (S * S * 4) as usize];
 
+    // Syncing comet: a bright arc near the rim, rotating one turn per 12 frames.
+    let arc_start = (frame % 12) as f32 * (TAU / 12.0);
+    let arc_len = 2.4_f32; // radians swept by the comet
+
     for y in 0..S {
         for x in 0..S {
             let px = x as f32 + 0.5;
             let py = y as f32 + 0.5;
-            let dist = ((px - c).powi(2) + (py - c).powi(2)).sqrt();
+            let dx = px - c;
+            let dy = py - c;
+            let dist = (dx * dx + dy * dy).sqrt();
 
             // Base shape alpha.
             let mut alpha = match state {
@@ -272,6 +287,25 @@ fn status_icon(state: TrayState) -> (Vec<u8>, u32, u32) {
                     cg = 255;
                     cb = 255;
                     alpha = 255.0;
+                }
+            }
+
+            // Syncing: sweep a white comet around the rim band. The head is
+            // bright white, the tail fades back into the blue disc.
+            if matches!(state, TrayState::Syncing) && alpha > 0.0 && dist >= radius - 5.0 {
+                let mut ang = dy.atan2(dx);
+                if ang < 0.0 {
+                    ang += TAU;
+                }
+                let mut rel = ang - arc_start;
+                while rel < 0.0 {
+                    rel += TAU;
+                }
+                if rel <= arc_len {
+                    let t = 1.0 - rel / arc_len; // 1 at head, 0 at tail
+                    cr = (r as f32 + (255.0 - r as f32) * t) as u8;
+                    cg = (g as f32 + (255.0 - g as f32) * t) as u8;
+                    cb = (b as f32 + (255.0 - b as f32) * t) as u8;
                 }
             }
 
