@@ -35,6 +35,7 @@ const els = {
   autostart: document.getElementById("autostart"),
   peerCount: document.getElementById("peer-count"),
   peerList: document.getElementById("peer-list"),
+  appVersion: document.getElementById("app-version"),
 };
 
 let codeExpiryTimer = null;
@@ -63,6 +64,7 @@ async function refresh() {
     els.folderPath.textContent = s.folder || "(not set)";
     els.btnOpenFolder.hidden = !s.folder;
     els.statusText.textContent = describeStatus(s);
+    if (s.version) els.appVersion.textContent = `v${s.version}`;
     els.peerCount.textContent = `${s.peers_online} / ${s.peers_known} online`;
     els.btnMakeTicket.disabled = false;
     await refreshPeers();

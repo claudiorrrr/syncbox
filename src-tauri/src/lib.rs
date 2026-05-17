@@ -61,6 +61,9 @@ struct StatusView {
     peers_online: usize,
     peers_known: usize,
     message: String,
+    /// App version: semver plus a build number (git commit count), both
+    /// resolved at compile time. Shown verbatim in the window footer.
+    version: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -608,6 +611,11 @@ async fn cmd_get_status(state: State<'_, AppState>) -> Result<StatusView, String
         peers_online,
         peers_known,
         message,
+        version: format!(
+            "{} (build {})",
+            env!("CARGO_PKG_VERSION"),
+            option_env!("SYNCBOX_BUILD").unwrap_or("?"),
+        ),
     })
 }
 
