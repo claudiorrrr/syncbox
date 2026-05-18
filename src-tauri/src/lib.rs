@@ -200,8 +200,6 @@ pub fn run() {
             cmd_start_sync,
             cmd_get_storage_size,
             cmd_block_peer,
-            cmd_unblock_peer,
-            cmd_list_blocked,
             cmd_set_read_only,
             cmd_get_read_only,
             cmd_write_default_ignore,
@@ -667,14 +665,19 @@ async fn cmd_get_peers(state: State<'_, AppState>) -> Result<Vec<PeerView>, Stri
         return Ok(vec![]);
     };
     let names = inner.names.clone();
+    let blocked = inner.blocked.clone();
     drop(inner);
     let name_map = match names {
         Some(n) => n.lock().await.clone(),
         None => HashMap::new(),
     };
+    // Devices we've stopped syncing with are hidden from the list entirely —
+    // they reappear only if the user pairs again, which clears the block.
+    let blocked_set = blocked.lock().await.clone();
     let p = peers.lock().await;
     let mut out: Vec<PeerView> = p
         .iter()
+        .filter(|(id, _)| !blocked_set.contains(*id))
         .map(|(id, e)| PeerView {
             id: id.clone(),
             online: e.online,
@@ -712,6 +715,10 @@ async fn cmd_get_ticket(
 
         inner.config.doc_ticket = Some(s.clone());
         inner.config.namespace_id = Some(doc.id().to_string());
+        // Pairing re-authorizes: clear the stop-syncing list so a device
+        // stopped earlier can sync again.
+        inner.config.blocked_peers.clear();
+        inner.blocked.lock().await.clear();
         config::save(&inner.config)
             .await
             .map_err(|e| e.to_string())?;
@@ -744,6 +751,10 @@ async fn cmd_join_with_ticket(
         inner.config.namespace_id = Some(doc.id().to_string());
         inner.config.doc_ticket = Some(ticket.trim().to_string());
         inner.doc = Some(doc);
+        // Pairing re-authorizes: clear the stop-syncing list so a device
+        // stopped earlier can sync again.
+        inner.config.blocked_peers.clear();
+        inner.blocked.lock().await.clear();
         config::save(&inner.config)
             .await
             .map_err(|e| e.to_string())?;
@@ -888,6 +899,10 @@ async fn cmd_make_code(
         let s = ticket.to_string();
         inner.config.namespace_id = Some(doc.id().to_string());
         inner.config.doc_ticket = Some(s.clone());
+        // Pairing re-authorizes: clear the stop-syncing list so a device
+        // stopped earlier can sync again.
+        inner.config.blocked_peers.clear();
+        inner.blocked.lock().await.clear();
         config::save(&inner.config)
             .await
             .map_err(|e| e.to_string())?;
@@ -944,6 +959,9 @@ fn dir_size(path: &std::path::Path) -> u64 {
     total
 }
 
+/// Stop syncing with a device: ignore its changes, hide it from the list, and
+/// forget its address. The block is undone by pairing again (see the pairing
+/// commands, which clear the block list).
 #[tauri::command]
 async fn cmd_block_peer(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let id = id.trim().to_string();
@@ -956,33 +974,14 @@ async fn cmd_block_peer(state: State<'_, AppState>, id: String) -> Result<(), St
         blocked.insert(id.clone());
     }
     if !inner.config.blocked_peers.contains(&id) {
-        inner.config.blocked_peers.push(id);
-        config::save(&inner.config)
-            .await
-            .map_err(|e| e.to_string())?;
+        inner.config.blocked_peers.push(id.clone());
     }
-    Ok(())
-}
-
-#[tauri::command]
-async fn cmd_unblock_peer(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    let id = id.trim().to_string();
-    let mut inner = state.inner.lock().await;
-    {
-        let mut blocked = inner.blocked.lock().await;
-        blocked.remove(&id);
-    }
-    inner.config.blocked_peers.retain(|x| x != &id);
+    // Forget the device's saved address so a later restart doesn't dial it.
+    inner.config.known_peers.retain(|p| p.id.to_string() != id);
     config::save(&inner.config)
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
-}
-
-#[tauri::command]
-async fn cmd_list_blocked(state: State<'_, AppState>) -> Result<Vec<String>, String> {
-    let inner = state.inner.lock().await;
-    Ok(inner.config.blocked_peers.clone())
 }
 
 #[tauri::command]

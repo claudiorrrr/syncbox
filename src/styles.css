@@ -191,28 +191,6 @@ footer {
   background: #34c759;
 }
 
-/* Revoked peers stay visible — red dot + tag, struck-through id — so a block
-   is never silent, even when the peer is currently online. */
-.peers li.blocked .dot {
-  background: var(--danger);
-}
-
-.peers li.blocked .pid {
-  text-decoration: line-through;
-  opacity: 0.6;
-}
-
-.peers li .tag {
-  flex-shrink: 0;
-  font-size: 9px;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  color: var(--danger);
-  border: 1px solid var(--danger);
-  border-radius: 4px;
-  padding: 0 4px;
-}
-
 .peers li .pid {
   overflow: hidden;
   text-overflow: ellipsis;
