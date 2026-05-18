@@ -709,6 +709,11 @@ async fn cmd_join_with_ticket(
             .map_err(|e| e.to_string())?;
         sync::log_line(&inner.log, "paired: joined shared folder, connecting…").await;
     }
+    // Joining swaps in a different doc. If a sync task was already running —
+    // from an earlier pairing, or because this device created its own doc
+    // first — it is still bound to the old namespace and will never see the
+    // peer we just joined. Stop it so the start below binds to the new doc.
+    shutdown(&app).await;
     let started = maybe_start_sync(&app).await.unwrap_or(false);
     if !started {
         // Doc is set but sync didn't start — almost always "no folder yet".
