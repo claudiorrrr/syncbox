@@ -26,8 +26,8 @@
       <section class="card">
         <h2>2. Pair</h2>
         <p class="muted">
-          On the first device, click <em>Get code</em>. Read the 6 characters
-          to the second device and tap <em>Use code</em>.
+          On the first device, click <em>Get code</em>. Type those 6
+          characters into the second device, then click <em>Use code</em>.
         </p>
 
         <div class="code-display">
@@ -40,7 +40,7 @@
         </div>
         <label class="checkbox">
           <input type="checkbox" id="ticket-read-only" />
-          <span>Issue read-only code (the other device receives but never writes back)</span>
+          <span>Read-only code — the other device receives changes but can't send any back</span>
         </label>
 
         <hr />
@@ -56,7 +56,7 @@
           <summary>Advanced: paste raw ticket</summary>
           <label class="block">
             <span>This device's ticket</span>
-            <textarea id="our-ticket" readonly placeholder="Click below"></textarea>
+            <textarea id="our-ticket" readonly placeholder="Click Show ticket below"></textarea>
           </label>
           <div class="row">
             <button id="btn-make-ticket">Show ticket</button>
@@ -84,7 +84,7 @@
           Status: <strong id="status-text">checking…</strong>
         </p>
         <p class="muted small">
-          Peers: <span id="peer-count">0 / 0 online</span>
+          Paired devices: <span id="peer-count">—</span>
         </p>
         <ul id="peer-list" class="peers"></ul>
         <p class="muted small">
@@ -99,7 +99,7 @@
         </label>
         <label class="checkbox">
           <input type="checkbox" id="read-only-local" />
-          <span>This device is read-only (don't push local changes)</span>
+          <span>Make this device read-only — changes made here won't sync out</span>
         </label>
         <div class="row">
           <button id="btn-write-ignore" class="link">
@@ -118,7 +118,8 @@
 
       <footer class="muted small">
         <p>
-          Files conflict copy is preserved as
+          If two devices change the same file at once, both are kept — the
+          incoming copy as
           <code>name.conflict-&lt;host&gt;-&lt;timestamp&gt;.ext</code>.
         </p>
         <p>syncbox <span id="app-version">—</span></p>

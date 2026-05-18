@@ -423,7 +423,7 @@ async fn bootstrap(app: &AppHandle) -> Result<()> {
 }
 
 fn build_tray(app: AppHandle) -> Result<()> {
-    let pair_item = MenuItem::with_id(&app, "pair", "Pair / Status…", true, None::<&str>)?;
+    let pair_item = MenuItem::with_id(&app, "pair", "Open syncbox", true, None::<&str>)?;
     let open_item = MenuItem::with_id(
         &app,
         "open_folder",

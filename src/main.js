@@ -73,7 +73,10 @@ async function refresh() {
     els.btnOpenFolder.hidden = !s.folder;
     els.statusText.textContent = describeStatus(s);
     if (s.version) els.appVersion.textContent = `v${s.version}`;
-    els.peerCount.textContent = `${s.peers_online} / ${s.peers_known} online`;
+    els.peerCount.textContent =
+      s.peers_known === 0
+        ? "none yet"
+        : `${s.peers_online} of ${s.peers_known} connected`;
     els.btnMakeTicket.disabled = false;
     await refreshPeers();
     await refreshStorage();
@@ -111,7 +114,7 @@ async function refreshPeers() {
         <span class="pid" title="${p.id}">${label}</span>
         ${isBlocked ? '<span class="tag">revoked</span>' : ""}
         <button class="link tiny" data-act="${isBlocked ? "unblock" : "block"}" data-id="${p.id}">
-          ${isBlocked ? "unblock" : "revoke"}
+          ${isBlocked ? "restore" : "revoke"}
         </button>
       `;
       els.peerList.appendChild(li);
@@ -125,7 +128,7 @@ async function refreshPeers() {
           act === "block" &&
           !confirm(
             "Revoke this device?\n\nsyncbox will ignore every change from it " +
-              "until you unblock it. Syncing with it stops.",
+              "until you restore it. Syncing with it stops.",
           )
         ) {
           return;
@@ -135,7 +138,8 @@ async function refreshPeers() {
           await invoke(cmd, { id });
           refreshPeers();
         } catch (e) {
-          alert(`Could not ${act}: ${e}`);
+          const verb = act === "block" ? "revoke" : "restore";
+          alert(`Could not ${verb} the device: ${e}`);
         }
       });
     });
