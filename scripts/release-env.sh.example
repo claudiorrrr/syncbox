@@ -18,3 +18,10 @@ export APPLE_API_KEY_PATH="$HOME/Downloads/AuthKey_REPLACE.p8"
 # set (empty here — the key was generated without one).
 export TAURI_SIGNING_PRIVATE_KEY="$HOME/.tauri/syncbox-updater.key"
 export TAURI_SIGNING_PRIVATE_KEY_PASSWORD=""
+
+# Developer ID cert as a .p12 — release.sh imports this into a throwaway
+# keychain each run so codesign works headless (over SSH, cron, no GUI login).
+#   P12_PATH     — path to the exported Certificates.p12 (keep out of the repo)
+#   P12_PASSWORD — the password set when the .p12 was exported
+export P12_PATH="$HOME/Downloads/Certificates.p12"
+export P12_PASSWORD="REPLACE_WITH_P12_PASSWORD"

@@ -13,6 +13,11 @@
 # Existing installs poll the `releases/latest/download/latest.json` URL on
 # launch and self-update; first-timers grab the .app.zip.
 #
+# Runs fully headless — over SSH, cron, no GUI login needed. codesign can't
+# reach the login keychain without a GUI ("Aqua") session, so this signs in a
+# throwaway keychain built from the .p12 each run (created, unlocked, and
+# partition-listed below, deleted on exit).
+#
 # Credentials live in scripts/release-env.sh (gitignored) — copy
 # scripts/release-env.sh.example and fill it in once.
 #
@@ -40,6 +45,36 @@ BUNDLE="target/release/bundle/macos"
 APP="$BUNDLE/syncbox.app"
 VERSION="${TAG#v}"
 
+# --- cleanup -------------------------------------------------------------
+# One trap for everything: scratch dir, the temp keychain, and the user's
+# keychain search list (which we prepend to below).
+WORK="$(mktemp -d)"
+KEYCHAIN_DIR="$(mktemp -d)"
+KEYCHAIN="$KEYCHAIN_DIR/syncbox-signing.keychain-db"
+ORIG_KEYCHAINS="$(security list-keychains -d user | sed 's/[\" ]//g' | tr '\n' ' ')"
+cleanup() {
+  security list-keychains -d user -s $ORIG_KEYCHAINS 2>/dev/null || true
+  security delete-keychain "$KEYCHAIN" 2>/dev/null || true
+  rm -rf "$WORK" "$KEYCHAIN_DIR"
+}
+trap cleanup EXIT
+
+# --- isolated signing keychain ------------------------------------------
+# Build a dedicated keychain from the .p12. Because we create, unlock, and
+# partition-list it right here, codesign can use it with no GUI session —
+# which is what makes headless / SSH releases work.
+KC_PW="$(uuidgen)"
+security create-keychain -p "$KC_PW" "$KEYCHAIN"
+security set-keychain-settings "$KEYCHAIN"          # no idle auto-lock
+security unlock-keychain -p "$KC_PW" "$KEYCHAIN"
+security import "$P12_PATH" -P "$P12_PASSWORD" -k "$KEYCHAIN" \
+  -T /usr/bin/codesign -T /usr/bin/security
+# Prepend our keychain to the search list so codesign finds the identity.
+security list-keychains -d user -s "$KEYCHAIN" $ORIG_KEYCHAINS
+# Let Apple codesigning tools use the key without an interactive prompt.
+security set-key-partition-list -S apple-tool:,apple:,codesign: \
+  -s -k "$KC_PW" "$KEYCHAIN" >/dev/null
+
 echo "Building signed + notarized release $TAG ..."
 bun run tauri build
 
@@ -57,9 +92,6 @@ TARBALL="$(ls "$BUNDLE"/*.app.tar.gz 2>/dev/null | head -1)"
   exit 1
 }
 [ -f "$TARBALL.sig" ] || { echo "updater signature ${TARBALL}.sig missing" >&2; exit 1; }
-
-WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
 
 # Asset 1 — plain app zip for first-time downloads.
 ditto -c -k --keepParent "$APP" "$WORK/syncbox-macos-arm64.app.zip"
