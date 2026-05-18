@@ -845,20 +845,65 @@ async fn apply_remote_delete(state: &SyncState, key: &[u8]) -> Result<()> {
 
 /// After removing `removed`, delete any parent directories it left empty,
 /// climbing toward `root`. Stops at `root` (never removed) or the first
-/// non-empty directory. Without this a remotely-deleted folder lingers as an
-/// empty husk on the receiving device.
+/// directory that still holds something. Without this a remotely-deleted
+/// folder lingers as an empty husk on the receiving device.
 async fn prune_empty_dirs(root: &Path, removed: &Path) {
     let mut dir = removed.parent();
     while let Some(d) = dir {
         if d == root || !d.starts_with(root) {
             break;
         }
-        // remove_dir only succeeds on an empty directory.
-        if tokio::fs::remove_dir(d).await.is_err() {
+        if !remove_dir_if_empty(d).await {
             break;
         }
         dir = d.parent();
     }
+}
+
+/// Remove `dir` if it holds nothing the user would miss — i.e. it's empty, or
+/// the only things left are OS-generated metadata files (`.DS_Store` and
+/// friends). Returns true if the directory was removed.
+///
+/// Plain `remove_dir` fails on a `.DS_Store`-only folder: macOS drops one into
+/// any directory opened in Finder, so a folder that looks empty to the user
+/// isn't empty to the filesystem. We never delete a real file the user keeps
+/// here, even one sync ignores — only known OS junk.
+async fn remove_dir_if_empty(dir: &Path) -> bool {
+    if tokio::fs::remove_dir(dir).await.is_ok() {
+        return true;
+    }
+    let mut rd = match tokio::fs::read_dir(dir).await {
+        Ok(rd) => rd,
+        Err(_) => return false,
+    };
+    let mut junk = Vec::new();
+    loop {
+        match rd.next_entry().await {
+            Ok(Some(ent)) => {
+                if is_os_junk(&ent.file_name()) {
+                    junk.push(ent.path());
+                } else {
+                    return false; // a real entry — leave the directory alone
+                }
+            }
+            Ok(None) => break,
+            Err(_) => return false,
+        }
+    }
+    for f in junk {
+        if tokio::fs::remove_file(&f).await.is_err() {
+            return false;
+        }
+    }
+    tokio::fs::remove_dir(dir).await.is_ok()
+}
+
+/// macOS and Windows scatter these metadata files into folders. They're never
+/// synced and the user never created them, so a directory holding only these
+/// is safe to remove.
+fn is_os_junk(name: &std::ffi::OsStr) -> bool {
+    let n = name.to_string_lossy();
+    n == ".DS_Store" || n == ".localized" || n == "Thumbs.db" || n.starts_with("._")
 }
 
 // ---------- helpers ----------
