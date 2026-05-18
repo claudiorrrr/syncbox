@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use iroh::{endpoint::presets, protocol::Router, Endpoint};
+use iroh::{endpoint::presets, protocol::Router, Endpoint, SecretKey};
 use iroh_blobs::{store::fs::FsStore, BlobsProtocol};
 use iroh_docs::{
     api::protocol::{AddrInfoOptions, ShareMode},
@@ -30,7 +30,15 @@ impl Node {
         // QUIC endpoint with n0 defaults: public relays and automatic NAT
         // traversal. No local mDNS — same-LAN peers still rendezvous through
         // a relay and node-id discovery.
-        let endpoint = Endpoint::bind(presets::N0)
+        //
+        // The secret key is this device's permanent node identity. It must be
+        // persisted: a fresh key each launch means a new node id every
+        // restart, so peers that saved our address can never reconnect — sync
+        // would silently die on the first restart.
+        let secret_key = load_or_create_secret_key(iroh_root)?;
+        let endpoint = Endpoint::builder(presets::N0)
+            .secret_key(secret_key)
+            .bind()
             .await
             .context("failed to bind iroh endpoint")?;
 
@@ -72,6 +80,29 @@ impl Node {
         self.router.shutdown().await?;
         Ok(())
     }
+}
+
+/// Load the device's persisted iroh secret key, or generate one and save it.
+///
+/// The key is the node's stable identity across restarts. Stored as 32 raw
+/// bytes in `iroh/secret.key`, owner-readable only. A malformed file is
+/// replaced rather than treated as fatal.
+fn load_or_create_secret_key(iroh_root: &Path) -> Result<SecretKey> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = iroh_root.join("secret.key");
+    if let Ok(bytes) = std::fs::read(&path) {
+        match <[u8; 32]>::try_from(bytes.as_slice()) {
+            Ok(arr) => return Ok(SecretKey::from_bytes(&arr)),
+            Err(_) => tracing::warn!("iroh/secret.key malformed; regenerating identity"),
+        }
+    }
+    std::fs::create_dir_all(iroh_root).context("create iroh dir")?;
+    let key = SecretKey::generate();
+    std::fs::write(&path, key.to_bytes()).context("write secret.key")?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .context("chmod secret.key")?;
+    Ok(key)
 }
 
 /// Default addressing for our tickets: include relay URL + direct addrs so
