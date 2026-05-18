@@ -212,6 +212,7 @@ async fn run_sync() -> Result<()> {
         stats: Arc::new(Mutex::new(Default::default())),
         status: Arc::new(Mutex::new(String::new())),
         log: Arc::new(Mutex::new(Default::default())),
+        names: Arc::new(Mutex::new(HashMap::new())),
     };
 
     // Persist freshly-seen peer addresses so the next restart can reconnect

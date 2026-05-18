@@ -14,7 +14,9 @@ use std::{
 };
 use syncbox_core::ignore_patterns::IgnoreSet;
 use syncbox_core::peer::Node;
-use syncbox_core::sync::{EchoGuard, LogHandle, PeerMap, StatsHandle, StatusLine, SyncState};
+use syncbox_core::sync::{
+    EchoGuard, LogHandle, NameMap, PeerMap, StatsHandle, StatusLine, SyncState,
+};
 use syncbox_core::{config, pair, peer, sync};
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
@@ -35,6 +37,7 @@ struct Inner {
     doc: Option<Doc>,
     echo: Option<EchoGuard>,
     peers: Option<PeerMap>,
+    names: Option<NameMap>,
     blocked: Arc<Mutex<HashSet<String>>>,
     active: Arc<AtomicU32>,
     stats: StatsHandle,
@@ -71,6 +74,8 @@ struct PeerView {
     id: String,
     online: bool,
     last_seen_unix: u64,
+    /// Friendly device name, if the peer has published one.
+    name: Option<String>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -337,6 +342,7 @@ async fn bootstrap(app: &AppHandle) -> Result<()> {
     inner.author = Some(author);
     inner.echo = Some(Arc::new(Mutex::new(Default::default())));
     inner.peers = Some(Arc::new(Mutex::new(HashMap::new())));
+    inner.names = Some(Arc::new(Mutex::new(HashMap::new())));
     {
         let mut blocked = inner.blocked.lock().await;
         blocked.extend(cfg.blocked_peers.iter().cloned());
@@ -525,6 +531,9 @@ async fn maybe_start_sync(app: &AppHandle) -> Result<bool> {
     let Some(peers) = inner.peers.clone() else {
         return Ok(false);
     };
+    let Some(names) = inner.names.clone() else {
+        return Ok(false);
+    };
     // Make sure we have an ignore matcher loaded for the current folder.
     if inner.ignores.is_none() {
         match IgnoreSet::load(&folder) {
@@ -565,6 +574,7 @@ async fn maybe_start_sync(app: &AppHandle) -> Result<bool> {
         stats,
         status,
         log,
+        names,
     };
     let handle = tauri::async_runtime::spawn(async move {
         if let Err(e) = sync::run(st, rx).await {
@@ -648,7 +658,12 @@ async fn cmd_get_peers(state: State<'_, AppState>) -> Result<Vec<PeerView>, Stri
     let Some(peers) = inner.peers.clone() else {
         return Ok(vec![]);
     };
+    let names = inner.names.clone();
     drop(inner);
+    let name_map = match names {
+        Some(n) => n.lock().await.clone(),
+        None => HashMap::new(),
+    };
     let p = peers.lock().await;
     let mut out: Vec<PeerView> = p
         .iter()
@@ -656,6 +671,7 @@ async fn cmd_get_peers(state: State<'_, AppState>) -> Result<Vec<PeerView>, Stri
             id: id.clone(),
             online: e.online,
             last_seen_unix: e.last_seen_unix,
+            name: name_map.get(id).cloned(),
         })
         .collect();
     out.sort_by(|a, b| {

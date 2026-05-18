@@ -38,6 +38,14 @@ const els = {
   appVersion: document.getElementById("app-version"),
 };
 
+// Escape text before putting it in innerHTML. Device names come from other
+// machines, so treat them as untrusted.
+const esc = (s) =>
+  String(s).replace(
+    /[&<>"]/g,
+    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c],
+  );
+
 let codeExpiryTimer = null;
 function startCodeCountdown(expiresUnix) {
   clearInterval(codeExpiryTimer);
@@ -96,9 +104,11 @@ async function refreshPeers() {
       if (p.online) li.classList.add("online");
       const isBlocked = blockedSet.has(p.id);
       if (isBlocked) li.classList.add("blocked");
+      // Show the device's published name; fall back to a short id.
+      const label = p.name ? esc(p.name) : `${p.id.slice(0, 16)}…`;
       li.innerHTML = `
         <span class="dot"></span>
-        <span class="pid" title="${p.id}">${p.id.slice(0, 16)}…</span>
+        <span class="pid" title="${p.id}">${label}</span>
         ${isBlocked ? '<span class="tag">revoked</span>' : ""}
         <button class="link tiny" data-act="${isBlocked ? "unblock" : "block"}" data-id="${p.id}">
           ${isBlocked ? "unblock" : "revoke"}

@@ -43,6 +43,11 @@ const DEBOUNCE_MS: u64 = 250;
 /// burst of incoming files collapses into a single disk-reconcile pass.
 const RECONCILE_DEBOUNCE_MS: u64 = 400;
 
+/// Key prefix for reserved entries that carry a device's display name. A real
+/// file key is a relative path, which can never start with a NUL byte, so
+/// these never collide with synced files.
+const NAME_KEY_PREFIX: &[u8] = b"\x00name/";
+
 /// What happened to a path because of a remote action. Stored briefly in the
 /// echo guard so the file watcher can recognise its own footprint and avoid
 /// bouncing the change back across the network.
@@ -66,6 +71,10 @@ pub struct PeerEntry {
 /// hex-encoded EndpointId. Updated by the sync event loop, consumed by the
 /// UI status command.
 pub type PeerMap = Arc<Mutex<HashMap<String, PeerEntry>>>;
+
+/// Shared map of endpoint-id (hex) → friendly device name, populated from the
+/// reserved name entries peers publish into the doc.
+pub type NameMap = Arc<Mutex<HashMap<String, String>>>;
 
 /// Rolling transfer statistics surfaced to the UI.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -136,6 +145,9 @@ pub struct SyncState {
     pub status: StatusLine,
     /// Debug log ring buffer, surfaced in the debug panel.
     pub log: LogHandle,
+    /// Endpoint-id (hex) → friendly device name, learned from the reserved
+    /// name entries peers publish into the doc.
+    pub names: NameMap,
 }
 
 /// Update the one-line status *and* append it to the debug log.
@@ -174,6 +186,9 @@ pub async fn run(state: SyncState, shutdown: tokio::sync::watch::Receiver<bool>)
     }
     if let Err(e) = scan_local(&state).await {
         tracing::warn!(error = ?e, "initial local scan failed");
+    }
+    if let Err(e) = publish_device_name(&state).await {
+        tracing::warn!(error = ?e, "publish device name failed");
     }
     set_status(&state, "watching for changes").await;
 
@@ -516,6 +531,12 @@ async fn reconcile_remote(state: &SyncState) -> Result<()> {
                 continue;
             }
         };
+        // Reserved name entries are device metadata, not files — record the
+        // name and never mirror them to disk.
+        if entry.key().starts_with(NAME_KEY_PREFIX) {
+            record_device_name(state, &entry).await;
+            continue;
+        }
         if entry.is_empty() {
             // Tombstone — make sure the file is gone locally.
             if let Err(e) = apply_remote_delete(state, entry.key()).await {
@@ -533,6 +554,72 @@ async fn reconcile_remote(state: &SyncState) -> Result<()> {
         set_status(state, format!("received {wrote} file(s)")).await;
     }
     Ok(())
+}
+
+/// Publish this device's display name into the doc under its reserved key, so
+/// peers show a friendly name instead of a hex id. Idempotent: skips the write
+/// when the doc already holds our current name, to avoid churn on every start.
+async fn publish_device_name(state: &SyncState) -> Result<()> {
+    let id = state.node.endpoint.id().to_string();
+    let mut key = NAME_KEY_PREFIX.to_vec();
+    key.extend_from_slice(id.as_bytes());
+    let key = Bytes::from(key);
+    let name = state.host.clone();
+
+    if let Ok(Some(entry)) = state.doc.get_one(Query::key_exact(key.clone())).await {
+        if !entry.is_empty() {
+            if let Ok(cur) = state
+                .node
+                .store
+                .blobs()
+                .get_bytes(entry.content_hash())
+                .await
+            {
+                if cur.as_ref() == name.as_bytes() {
+                    state.names.lock().await.insert(id, name);
+                    return Ok(());
+                }
+            }
+        }
+    }
+    state
+        .doc
+        .set_bytes(state.author, key, Bytes::from(name.clone().into_bytes()))
+        .await
+        .context("publish device name")?;
+    state.names.lock().await.insert(id, name);
+    Ok(())
+}
+
+/// Record the device name carried by a reserved name entry into the shared
+/// name map. A not-yet-downloaded blob is ignored — a later reconcile retries.
+async fn record_device_name(state: &SyncState, entry: &Entry) {
+    let Some(id) = entry
+        .key()
+        .strip_prefix(NAME_KEY_PREFIX)
+        .and_then(|b| std::str::from_utf8(b).ok())
+    else {
+        return;
+    };
+    if entry.is_empty() {
+        state.names.lock().await.remove(id);
+        return;
+    }
+    if let Ok(bytes) = state
+        .node
+        .store
+        .blobs()
+        .get_bytes(entry.content_hash())
+        .await
+    {
+        if let Ok(name) = std::str::from_utf8(&bytes) {
+            state
+                .names
+                .lock()
+                .await
+                .insert(id.to_string(), name.to_string());
+        }
+    }
 }
 
 /// Write one doc entry to disk. Returns Ok(true) if a file was written,
