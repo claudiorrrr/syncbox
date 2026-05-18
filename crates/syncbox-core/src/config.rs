@@ -15,8 +15,12 @@ pub struct Config {
     /// existing local replica on restart without going through `import`,
     /// which fails if the namespace already exists.
     pub namespace_id: Option<String>,
-    /// Display name used in `.conflict-<host>-<ts>` filenames.
+    /// The machine's own hostname. Fallback name when `device_name` is unset.
     pub hostname: String,
+    /// User-chosen name for this device, shown to paired devices. None → the
+    /// `hostname` is used instead. Set in the GUI.
+    #[serde(default)]
+    pub device_name: Option<String>,
     /// Full EndpointAddrs of peers we've seen synced with this doc. On
     /// restart we feed them to `doc.start_sync` so reconnection doesn't
     /// have to wait for fresh relay/mDNS discovery from scratch.
@@ -52,6 +56,15 @@ impl Config {
             .ok()
             .and_then(|s| s.into_string().ok())
             .unwrap_or_else(|| "unknown".into())
+    }
+
+    /// The name shown to paired devices and used in `.conflict-<host>-<ts>`
+    /// filenames: the user-chosen `device_name` if set, else the `hostname`.
+    pub fn display_name(&self) -> String {
+        match &self.device_name {
+            Some(n) if !n.trim().is_empty() => n.trim().to_string(),
+            _ => self.hostname.clone(),
+        }
     }
 }
 

@@ -200,6 +200,8 @@ pub fn run() {
             cmd_start_sync,
             cmd_get_storage_size,
             cmd_block_peer,
+            cmd_get_device_name,
+            cmd_set_device_name,
             cmd_set_read_only,
             cmd_get_read_only,
             cmd_write_default_ignore,
@@ -555,7 +557,7 @@ async fn maybe_start_sync(app: &AppHandle) -> Result<bool> {
     let log = inner.log.clone();
     let read_only = inner.config.read_only_local;
 
-    let host = inner.config.hostname.clone();
+    let host = inner.config.display_name();
 
     let (tx, rx) = watch::channel(false);
     inner.shutdown = Some(tx);
@@ -982,6 +984,43 @@ async fn cmd_block_peer(state: State<'_, AppState>, id: String) -> Result<(), St
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// The name shown to paired devices: the user-chosen name, or the hostname.
+#[tauri::command]
+async fn cmd_get_device_name(state: State<'_, AppState>) -> Result<String, String> {
+    let inner = state.inner.lock().await;
+    Ok(inner.config.display_name())
+}
+
+/// Rename this device. An empty name clears the custom name and falls back to
+/// the hostname. Returns the resolved name actually in effect. The new name is
+/// re-published to the doc so paired devices pick it up without a restart.
+#[tauri::command]
+async fn cmd_set_device_name(state: State<'_, AppState>, name: String) -> Result<String, String> {
+    let mut inner = state.inner.lock().await;
+    let trimmed = name.trim();
+    inner.config.device_name = if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    };
+    config::save(&inner.config)
+        .await
+        .map_err(|e| e.to_string())?;
+    let display = inner.config.display_name();
+
+    if let (Some(doc), Some(author), Some(node), Some(names)) = (
+        inner.doc.clone(),
+        inner.author,
+        inner.node.clone(),
+        inner.names.clone(),
+    ) {
+        if let Err(e) = sync::publish_name(&doc, author, &node, &names, &display).await {
+            tracing::warn!(error = ?e, "re-publish device name failed");
+        }
+    }
+    Ok(display)
 }
 
 #[tauri::command]

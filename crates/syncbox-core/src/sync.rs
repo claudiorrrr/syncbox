@@ -652,39 +652,51 @@ async fn reconcile_remote(state: &SyncState) -> Result<()> {
     Ok(())
 }
 
-/// Publish this device's display name into the doc under its reserved key, so
+/// Publish a device's display name into the doc under its reserved key, so
 /// peers show a friendly name instead of a hex id. Idempotent: skips the write
-/// when the doc already holds our current name, to avoid churn on every start.
-async fn publish_device_name(state: &SyncState) -> Result<()> {
-    let id = state.node.endpoint.id().to_string();
+/// when the doc already holds this exact name, to avoid churn. Also records
+/// the name in the shared name map. Called at startup and whenever the user
+/// renames the device in the GUI.
+pub async fn publish_name(
+    doc: &Doc,
+    author: AuthorId,
+    node: &Node,
+    names: &NameMap,
+    name: &str,
+) -> Result<()> {
+    let id = node.endpoint.id().to_string();
     let mut key = NAME_KEY_PREFIX.to_vec();
     key.extend_from_slice(id.as_bytes());
     let key = Bytes::from(key);
-    let name = state.host.clone();
 
-    if let Ok(Some(entry)) = state.doc.get_one(Query::key_exact(key.clone())).await {
+    if let Ok(Some(entry)) = doc.get_one(Query::key_exact(key.clone())).await {
         if !entry.is_empty() {
-            if let Ok(cur) = state
-                .node
-                .store
-                .blobs()
-                .get_bytes(entry.content_hash())
-                .await
-            {
+            if let Ok(cur) = node.store.blobs().get_bytes(entry.content_hash()).await {
                 if cur.as_ref() == name.as_bytes() {
-                    state.names.lock().await.insert(id, name);
+                    names.lock().await.insert(id, name.to_string());
                     return Ok(());
                 }
             }
         }
     }
-    state
-        .doc
-        .set_bytes(state.author, key, Bytes::from(name.clone().into_bytes()))
+    doc.set_bytes(author, key, Bytes::from(name.as_bytes().to_vec()))
         .await
         .context("publish device name")?;
-    state.names.lock().await.insert(id, name);
+    names.lock().await.insert(id, name.to_string());
     Ok(())
+}
+
+/// Publish this running engine's configured display name. Thin wrapper over
+/// [`publish_name`] for the startup call.
+async fn publish_device_name(state: &SyncState) -> Result<()> {
+    publish_name(
+        &state.doc,
+        state.author,
+        &state.node,
+        &state.names,
+        &state.host,
+    )
+    .await
 }
 
 /// Record the device name carried by a reserved name entry into the shared

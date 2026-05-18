@@ -6,7 +6,7 @@
 const { invoke } = window.__TAURI__.core;
 
 const els = {
-  hostname: document.getElementById("hostname"),
+  deviceName: document.getElementById("device-name"),
   folderPath: document.getElementById("folder-path"),
   btnChooseFolder: document.getElementById("btn-choose-folder"),
   btnOpenFolder: document.getElementById("btn-open-folder"),
@@ -68,7 +68,6 @@ function startCodeCountdown(expiresUnix) {
 async function refresh() {
   try {
     const s = await invoke("cmd_get_status");
-    els.hostname.textContent = s.hostname || "this device";
     els.folderPath.textContent = s.folder || "(not set)";
     els.btnOpenFolder.hidden = !s.folder;
     els.statusText.textContent = describeStatus(s);
@@ -365,6 +364,29 @@ async function loadReadOnly() {
   }
 }
 
+async function loadDeviceName() {
+  try {
+    els.deviceName.value = await invoke("cmd_get_device_name");
+  } catch {
+    /* not critical */
+  }
+}
+
+// Commit on blur or Enter. The backend echoes back the name in effect — an
+// empty box falls back to the hostname, so reflect that.
+els.deviceName.addEventListener("change", async () => {
+  try {
+    els.deviceName.value = await invoke("cmd_set_device_name", {
+      name: els.deviceName.value,
+    });
+  } catch (e) {
+    alert(`Could not save the device name: ${e}`);
+  }
+});
+els.deviceName.addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter") els.deviceName.blur();
+});
+
 // On launch, ask GitHub whether a newer release exists. If so, prompt the
 // user; on yes, download, install, and relaunch into the new version. Silent
 // on any failure (offline, GitHub down): a missed check is never worth
@@ -413,6 +435,7 @@ refresh();
 loadAutostart();
 loadPairServer();
 loadReadOnly();
+loadDeviceName();
 checkForUpdates();
 refreshLog();
 setInterval(refresh, 3000);

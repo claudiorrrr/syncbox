@@ -208,7 +208,7 @@ async fn run_sync() -> Result<()> {
         doc,
         author,
         root: folder,
-        host: cfg.hostname.clone(),
+        host: cfg.display_name(),
         echo: Arc::new(Mutex::new(HashMap::new())),
         peers: Arc::new(Mutex::new(HashMap::new())),
         addr_sink: addr_tx,

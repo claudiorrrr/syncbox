@@ -10,7 +10,15 @@
     <main>
       <header>
         <h1>syncbox</h1>
-        <p class="muted" id="hostname">this device</p>
+        <input
+          id="device-name"
+          class="device-name"
+          type="text"
+          maxlength="40"
+          placeholder="Name this device"
+          aria-label="This device's name"
+          title="The name other devices see for this one. Click to rename."
+        />
       </header>
 
       <section class="card">
