@@ -164,7 +164,10 @@ async fn run_sync() -> Result<()> {
     }
 
     let node = spawn_node().await?;
-    let author = node.docs.author_create().await.context("create author")?;
+    // Stable doc author, persisted by iroh-docs across restarts. Must not
+    // rotate: doc.del's prefix delete is author-scoped, so a fresh author each
+    // run cannot delete folders an earlier run published.
+    let author = node.docs.author_default().await.context("default author")?;
 
     let doc = open_doc(&node, &mut cfg)
         .await?

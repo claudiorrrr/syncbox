@@ -220,7 +220,7 @@ pub async fn run(state: SyncState, shutdown: tokio::sync::watch::Receiver<bool>)
 
             Some(paths) = rx.recv() => {
                 for p in paths {
-                    if let Err(e) = handle_local_change(&state, &p).await {
+                    if let Err(e) = handle_local_change(&state, &p, false).await {
                         tracing::warn!(path = %p.display(), error = ?e, "local change failed");
                     }
                 }
@@ -285,7 +285,7 @@ fn spawn_watcher(
 
 // ---------- local → doc ----------
 
-async fn handle_local_change(state: &SyncState, path: &Path) -> Result<()> {
+async fn handle_local_change(state: &SyncState, path: &Path, from_scan: bool) -> Result<()> {
     if state.read_only {
         return Ok(());
     }
@@ -308,15 +308,10 @@ async fn handle_local_change(state: &SyncState, path: &Path) -> Result<()> {
                 return Ok(());
             }
         }
-        match state.doc.del(state.author, key.clone()).await {
-            Ok(removed) => {
-                tracing::info!(path = %rel.display(), removed, "propagated local delete");
-                set_status(state, format!("deleted {}", rel.display())).await;
-            }
-            Err(e) => {
-                tracing::warn!(error = ?e, "doc.del failed");
-                note(state, format!("error deleting {}: {e}", rel.display())).await;
-            }
+        let removed = delete_from_doc(state, &key).await;
+        if removed > 0 {
+            tracing::info!(path = %rel.display(), removed, "propagated local delete");
+            set_status(state, format!("deleted {}", rel.display())).await;
         }
         return Ok(());
     }
@@ -326,19 +321,74 @@ async fn handle_local_change(state: &SyncState, path: &Path) -> Result<()> {
         // A directory was created or moved into the folder (e.g. dragged in
         // via Finder). The watcher often reports only the directory, not the
         // files inside it — walk the subtree and publish every file.
-        upload_subtree(state, path).await?;
+        upload_subtree(state, path, from_scan).await?;
         return Ok(());
     }
     if !meta.is_file() {
         return Ok(());
     }
-    upload_file(state, path).await
+    upload_file(state, path, from_scan).await
+}
+
+/// Tombstone a removed path in the doc. A removed file tombstones its own
+/// key; a removed directory tombstones every file key beneath it.
+///
+/// We `doc.del` each *exact* key rather than relying on `doc.del`'s prefix
+/// form, because iroh-docs' prefix delete only clears entries authored by
+/// *this* device (`remove_prefix_filtered` is author-scoped). Files an earlier
+/// session — or the other peer — published live under a different author and
+/// would survive a directory-level delete, resurrecting the folder. An
+/// exact-key tombstone, by contrast, wins by timestamp across every author.
+async fn delete_from_doc(state: &SyncState, key: &Bytes) -> usize {
+    let kb: &[u8] = key.as_ref();
+    let mut victims: Vec<Bytes> = Vec::new();
+
+    // Every non-empty doc key at or below this path. key_prefix also matches
+    // sibling names ("X" matches "Xyz"), so keep only the exact path and real
+    // children ("X/...").
+    match state
+        .doc
+        .get_many(Query::single_latest_per_key().key_prefix(key.clone()))
+        .await
+    {
+        Ok(stream) => {
+            tokio::pin!(stream);
+            while let Some(entry) = stream.next().await {
+                let Ok(entry) = entry else { continue };
+                if entry.is_empty() {
+                    continue;
+                }
+                let k = entry.key();
+                if k == kb || (k.len() > kb.len() && k.starts_with(kb) && k[kb.len()] == b'/') {
+                    victims.push(Bytes::copy_from_slice(k));
+                }
+            }
+        }
+        Err(e) => tracing::warn!(error = ?e, "enumerate keys to delete failed"),
+    }
+    // Nothing found — still tombstone the exact key, so a file whose entry the
+    // query missed is covered. Harmless if the key is already gone.
+    if victims.is_empty() {
+        victims.push(key.clone());
+    }
+
+    let mut removed = 0;
+    for k in victims {
+        match state.doc.del(state.author, k).await {
+            Ok(_) => removed += 1,
+            Err(e) => {
+                tracing::warn!(error = ?e, "doc.del failed");
+                note(state, format!("error deleting: {e}")).await;
+            }
+        }
+    }
+    removed
 }
 
 /// Publish a single file to the doc. Skips ignored paths, echoes of our own
 /// writes, and content already present in the doc. The file is streamed into
 /// the blob store, so memory use is constant regardless of file size.
-async fn upload_file(state: &SyncState, path: &Path) -> Result<()> {
+async fn upload_file(state: &SyncState, path: &Path, from_scan: bool) -> Result<()> {
     let rel = match path.strip_prefix(&state.root) {
         Ok(r) => r.to_path_buf(),
         Err(_) => return Ok(()),
@@ -364,9 +414,27 @@ async fn upload_file(state: &SyncState, path: &Path) -> Result<()> {
         }
     }
 
-    // Already in the doc with the same content? Nothing to do.
-    if let Ok(Some(entry)) = state.doc.get_one(Query::key_exact(key.clone())).await {
-        if !entry.is_empty() && entry.content_hash() == want {
+    // Look up the current winning doc entry for this key, tombstone included.
+    if let Ok(Some(entry)) = state
+        .doc
+        .get_one(
+            Query::single_latest_per_key()
+                .key_exact(key.clone())
+                .include_empty(),
+        )
+        .await
+    {
+        if entry.is_empty() {
+            // The doc says this path was deleted. During the startup scan a
+            // file still on disk is a leftover the pending reconcile is about
+            // to remove; re-publishing it would out-timestamp the tombstone
+            // and resurrect the file on every peer. Skip it. A live watcher
+            // event means the user re-created the file — fall through.
+            if from_scan {
+                return Ok(());
+            }
+        } else if entry.content_hash() == want {
+            // Already in the doc with the same content — nothing to do.
             return Ok(());
         }
     }
@@ -394,7 +462,7 @@ async fn upload_file(state: &SyncState, path: &Path) -> Result<()> {
 }
 
 /// Walk a directory subtree and publish every file inside it.
-async fn upload_subtree(state: &SyncState, dir: &Path) -> Result<()> {
+async fn upload_subtree(state: &SyncState, dir: &Path, from_scan: bool) -> Result<()> {
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
         if let Ok(rel) = d.strip_prefix(&state.root) {
@@ -412,7 +480,7 @@ async fn upload_subtree(state: &SyncState, dir: &Path) -> Result<()> {
             if ft.is_dir() {
                 stack.push(p);
             } else if ft.is_file() {
-                if let Err(e) = upload_file(state, &p).await {
+                if let Err(e) = upload_file(state, &p, from_scan).await {
                     tracing::warn!(path = %p.display(), error = ?e, "subtree upload failed");
                 }
             }
@@ -443,7 +511,7 @@ async fn scan_local(state: &SyncState) -> Result<()> {
             if ft.is_dir() {
                 stack.push(p);
             } else if ft.is_file() {
-                if let Err(e) = handle_local_change(state, &p).await {
+                if let Err(e) = handle_local_change(state, &p, true).await {
                     tracing::warn!(path = %p.display(), error = ?e, "scan upload failed");
                 }
             }

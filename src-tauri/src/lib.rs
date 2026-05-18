@@ -333,8 +333,10 @@ async fn bootstrap(app: &AppHandle) -> Result<()> {
     let iroh_root = config::iroh_root()?;
     let node = Arc::new(Node::spawn(&iroh_root).await?);
 
-    // Always have at least one author per device.
-    let author = node.docs.author_create().await?;
+    // The device's stable doc author, persisted by iroh-docs across restarts.
+    // Must not rotate: doc.del's prefix delete is author-scoped, so a fresh
+    // author each run cannot delete folders an earlier run published.
+    let author = node.docs.author_default().await?;
 
     let mut inner = state.inner.lock().await;
     inner.config = cfg.clone();
