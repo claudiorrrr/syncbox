@@ -17,6 +17,19 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# tauri.conf.json sets createUpdaterArtifacts, so every build — even a local
+# install — signs the updater tarball and needs the updater key.
+UPDATER_KEY="$HOME/.tauri/syncbox-updater.key"
+if [ ! -f "$UPDATER_KEY" ]; then
+  echo "missing updater signing key at $UPDATER_KEY" >&2
+  echo "generate it once: bun run tauri signer generate -w \"$UPDATER_KEY\" --ci" >&2
+  exit 1
+fi
+# The bundler reads TAURI_SIGNING_PRIVATE_KEY as the key file path, and still
+# expects the password var even though this key has none — set it empty.
+export TAURI_SIGNING_PRIVATE_KEY="$UPDATER_KEY"
+export TAURI_SIGNING_PRIVATE_KEY_PASSWORD=""
+
 echo "Building…"
 bun run tauri build
 

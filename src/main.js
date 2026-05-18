@@ -351,10 +351,37 @@ async function loadReadOnly() {
   }
 }
 
+// On launch, ask GitHub whether a newer release exists. If so, prompt the
+// user; on yes, download, install, and relaunch into the new version. Silent
+// on any failure (offline, GitHub down): a missed check is never worth
+// interrupting the user over.
+async function checkForUpdates() {
+  try {
+    const update = await window.__TAURI__.updater.check();
+    if (!update) return;
+    const ok = await window.__TAURI__.dialog.ask(
+      `syncbox ${update.version} is available (you have ${update.currentVersion}).\n\n` +
+        "Install it now? The app will restart.",
+      {
+        title: "Update available",
+        kind: "info",
+        okLabel: "Install",
+        cancelLabel: "Later",
+      },
+    );
+    if (!ok) return;
+    await update.downloadAndInstall();
+    await window.__TAURI__.process.relaunch();
+  } catch (e) {
+    console.warn("update check failed:", e);
+  }
+}
+
 refresh();
 loadAutostart();
 loadPairServer();
 loadReadOnly();
+checkForUpdates();
 refreshLog();
 setInterval(refresh, 3000);
 // Transfer rate + debug log update faster so they feel live.

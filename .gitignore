@@ -25,3 +25,6 @@ target/
 
 # Build-time default pair-server host — personal, kept out of the repo.
 /pair-server.txt
+
+# Release credentials for scripts/release.sh — copy from release-env.sh.example.
+/scripts/release-env.sh

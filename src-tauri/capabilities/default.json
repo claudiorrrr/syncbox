@@ -11,7 +11,10 @@
     "core:window:allow-set-focus",
     "core:webview:allow-internal-toggle-devtools",
     "dialog:allow-open",
+    "dialog:allow-ask",
     "opener:default",
-    "autostart:default"
+    "autostart:default",
+    "updater:default",
+    "process:default"
   ]
 }

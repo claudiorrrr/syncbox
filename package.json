@@ -1,13 +1,14 @@
 {
   "name": "syncbox",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "tauri": "tauri",
     "dev": "tauri dev",
     "build": "tauri build",
-    "reinstall": "./scripts/install-app.sh"
+    "reinstall": "./scripts/install-app.sh",
+    "release": "./scripts/release.sh"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.0.0"

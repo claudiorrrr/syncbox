@@ -85,6 +85,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
             None,
@@ -132,8 +134,7 @@ pub fn run() {
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_millis() as u64)
                             .unwrap_or(0);
-                        s.last_activity_ms != 0
-                            && now.saturating_sub(s.last_activity_ms) < 1200
+                        s.last_activity_ms != 0 && now.saturating_sub(s.last_activity_ms) < 1200
                     };
                     drop(inner);
 
@@ -147,8 +148,7 @@ pub fn run() {
 
                     // Redraw on a state change, and every tick while syncing
                     // so the comet keeps moving.
-                    let redraw = last_state != Some(tray_state)
-                        || tray_state == TrayState::Syncing;
+                    let redraw = last_state != Some(tray_state) || tray_state == TrayState::Syncing;
                     if redraw {
                         if let Some(tray) = handle.tray_by_id("main") {
                             let (rgba, w, h) = status_icon(tray_state, frame);

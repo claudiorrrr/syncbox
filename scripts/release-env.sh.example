@@ -1,0 +1,20 @@
+# Credentials for scripts/release.sh — copy to scripts/release-env.sh and fill
+# in. The real file is gitignored; this template is committed.
+#
+# Apple signing identity — public string, already correct for this team.
+export APPLE_SIGNING_IDENTITY="Developer ID Application: Super 45 Producciones Limitada (SJS75W7C48)"
+
+# App Store Connect API key — used to notarize. Get these from the .p8 the
+# Account Holder generated (App Store Connect → Users and Access → Integrations).
+#   APPLE_API_KEY      — the Key ID
+#   APPLE_API_ISSUER   — the Issuer ID (UUID)
+#   APPLE_API_KEY_PATH — path to the AuthKey_*.p8 file (keep it out of the repo)
+export APPLE_API_KEY="REPLACE_WITH_KEY_ID"
+export APPLE_API_ISSUER="REPLACE_WITH_ISSUER_ID"
+export APPLE_API_KEY_PATH="$HOME/Downloads/AuthKey_REPLACE.p8"
+
+# Tauri updater signing key — generated once with `tauri signer generate`.
+# TAURI_SIGNING_PRIVATE_KEY takes the key file path; the password var must be
+# set (empty here — the key was generated without one).
+export TAURI_SIGNING_PRIVATE_KEY="$HOME/.tauri/syncbox-updater.key"
+export TAURI_SIGNING_PRIVATE_KEY_PASSWORD=""
