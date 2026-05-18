@@ -19,7 +19,7 @@ use syncbox_core::{config, pair, peer, sync};
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Manager, State,
+    AppHandle, Emitter, Manager, State,
 };
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_dialog::DialogExt;
@@ -417,9 +417,19 @@ fn build_tray(app: AppHandle) -> Result<()> {
         true,
         None::<&str>,
     )?;
+    let update_item = MenuItem::with_id(
+        &app,
+        "check_updates",
+        "Check for Updates…",
+        true,
+        None::<&str>,
+    )?;
     let sep = PredefinedMenuItem::separator(&app)?;
     let quit_item = MenuItem::with_id(&app, "quit", "Quit syncbox", true, None::<&str>)?;
-    let menu = Menu::with_items(&app, &[&pair_item, &open_item, &sep, &quit_item])?;
+    let menu = Menu::with_items(
+        &app,
+        &[&pair_item, &open_item, &update_item, &sep, &quit_item],
+    )?;
 
     let _tray = TrayIconBuilder::with_id("main")
         .icon(
@@ -442,6 +452,12 @@ fn build_tray(app: AppHandle) -> Result<()> {
                 tauri::async_runtime::spawn(async move {
                     let _ = cmd_open_folder_inner(&app_clone).await;
                 });
+            }
+            "check_updates" => {
+                // The update check + dialog + install all live in the webview.
+                // Nudge it with an event; the window can stay hidden, the
+                // updater's own dialogs surface the result.
+                let _ = app.emit("check-update", ());
             }
             "quit" => {
                 let app_clone = app.clone();

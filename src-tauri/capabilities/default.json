@@ -12,6 +12,7 @@
     "core:webview:allow-internal-toggle-devtools",
     "dialog:allow-open",
     "dialog:allow-ask",
+    "dialog:allow-message",
     "opener:default",
     "autostart:default",
     "updater:default",

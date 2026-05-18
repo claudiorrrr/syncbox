@@ -376,10 +376,19 @@ async function loadReadOnly() {
 // user; on yes, download, install, and relaunch into the new version. Silent
 // on any failure (offline, GitHub down): a missed check is never worth
 // interrupting the user over.
-async function checkForUpdates() {
+async function checkForUpdates(manual = false) {
   try {
     const update = await window.__TAURI__.updater.check();
-    if (!update) return;
+    if (!update) {
+      // An automatic launch check stays silent; a manual one (tray menu)
+      // must confirm it actually ran.
+      if (manual) {
+        await window.__TAURI__.dialog.message("syncbox is up to date.", {
+          title: "Check for Updates",
+        });
+      }
+      return;
+    }
     const ok = await window.__TAURI__.dialog.ask(
       `syncbox ${update.version} is available (you have ${update.currentVersion}).\n\n` +
         "Install it now? The app will restart.",
@@ -395,8 +404,17 @@ async function checkForUpdates() {
     await window.__TAURI__.process.relaunch();
   } catch (e) {
     console.warn("update check failed:", e);
+    if (manual) {
+      await window.__TAURI__.dialog.message(`Could not check for updates: ${e}`, {
+        title: "Check for Updates",
+        kind: "error",
+      });
+    }
   }
 }
+
+// Tray "Check for Updates…" emits this — run a check that reports its result.
+window.__TAURI__.event.listen("check-update", () => checkForUpdates(true));
 
 refresh();
 loadAutostart();
