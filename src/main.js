@@ -82,14 +82,24 @@ async function refreshPeers() {
       invoke("cmd_list_blocked"),
     ]);
     const blockedSet = new Set(blocked);
+    const live = new Set(peers.map((p) => p.id));
+    // A revoked device drops out of the live peer list once it's offline —
+    // append blocked-but-not-live peers so a revoke is always visible and
+    // undoable, not silently buried in config.
+    const rows = [...peers];
+    for (const id of blocked) {
+      if (!live.has(id)) rows.push({ id, online: false, last_seen_unix: 0 });
+    }
     els.peerList.innerHTML = "";
-    for (const p of peers) {
+    for (const p of rows) {
       const li = document.createElement("li");
       if (p.online) li.classList.add("online");
       const isBlocked = blockedSet.has(p.id);
+      if (isBlocked) li.classList.add("blocked");
       li.innerHTML = `
         <span class="dot"></span>
         <span class="pid" title="${p.id}">${p.id.slice(0, 16)}…</span>
+        ${isBlocked ? '<span class="tag">revoked</span>' : ""}
         <button class="link tiny" data-act="${isBlocked ? "unblock" : "block"}" data-id="${p.id}">
           ${isBlocked ? "unblock" : "revoke"}
         </button>
@@ -99,12 +109,23 @@ async function refreshPeers() {
     els.peerList.querySelectorAll("button[data-act]").forEach((btn) => {
       btn.addEventListener("click", async (ev) => {
         const id = ev.target.dataset.id;
-        const cmd = ev.target.dataset.act === "block" ? "cmd_block_peer" : "cmd_unblock_peer";
+        const act = ev.target.dataset.act;
+        // Revoking silently stops sync with a device — confirm before doing it.
+        if (
+          act === "block" &&
+          !confirm(
+            "Revoke this device?\n\nsyncbox will ignore every change from it " +
+              "until you unblock it. Syncing with it stops.",
+          )
+        ) {
+          return;
+        }
+        const cmd = act === "block" ? "cmd_block_peer" : "cmd_unblock_peer";
         try {
           await invoke(cmd, { id });
           refreshPeers();
         } catch (e) {
-          alert(`Could not ${ev.target.dataset.act}: ${e}`);
+          alert(`Could not ${act}: ${e}`);
         }
       });
     });
