@@ -25,7 +25,7 @@ use iroh_blobs::{
     api::blobs::{ExportMode, ImportMode},
     Hash,
 };
-use iroh_docs::{api::Doc, engine::LiveEvent, store::Query, AuthorId, Entry};
+use iroh_docs::{api::Doc, engine::LiveEvent, store::Query, AuthorId, ContentStatus, Entry};
 use notify::{EventKind, RecursiveMode};
 use notify_debouncer_full::new_debouncer;
 use serde::Serialize;
@@ -90,6 +90,12 @@ pub struct TransferStats {
     /// Wall-clock of the last byte moved in *either* direction, unix ms.
     /// The tray reads this to animate the "syncing" icon.
     pub last_activity_ms: u64,
+    /// Doc entries whose blob content is still downloading from a peer. The
+    /// network transfer itself runs inside iroh-blobs, invisible to us — this
+    /// counter is how the tray knows a download is in flight. Bumped by a
+    /// remote insert whose content isn't local yet, drawn down by
+    /// ContentReady events, and zeroed when a sync run drains its queue.
+    pub pending_downloads: u32,
 }
 
 pub type StatsHandle = Arc<Mutex<TransferStats>>;
@@ -525,7 +531,11 @@ async fn scan_local(state: &SyncState) -> Result<()> {
 /// True if the event was content-related and a reconcile should be scheduled.
 async fn handle_event(state: &SyncState, ev: LiveEvent) -> bool {
     match ev {
-        LiveEvent::InsertRemote { from, .. } => {
+        LiveEvent::InsertRemote {
+            from,
+            entry,
+            content_status,
+        } => {
             {
                 let blocked = state.blocked.lock().await;
                 if blocked.contains(&from.to_string()) {
@@ -533,14 +543,32 @@ async fn handle_event(state: &SyncState, ev: LiveEvent) -> bool {
                     return false;
                 }
             }
+            // A non-empty entry whose blob isn't here yet means iroh-blobs has
+            // a download queued — count it so the tray shows the syncing icon
+            // until the matching ContentReady lands.
+            if !entry.is_empty() && content_status != ContentStatus::Complete {
+                let mut s = state.stats.lock().await;
+                s.pending_downloads = s.pending_downloads.saturating_add(1);
+                s.last_activity_ms = now_unix_ms();
+            }
             // Content entry or tombstone — let the debounced reconcile apply
             // it. reconcile_remote walks single_latest_per_key, so it always
             // acts on the CRDT's winning entry: a stale tombstone can't delete
             // a newer edit, nor a stale edit resurrect a deleted file.
             true
         }
-        LiveEvent::ContentReady { .. } => true,
-        LiveEvent::PendingContentReady => true,
+        LiveEvent::ContentReady { .. } => {
+            let mut s = state.stats.lock().await;
+            s.pending_downloads = s.pending_downloads.saturating_sub(1);
+            s.last_activity_ms = now_unix_ms();
+            true
+        }
+        LiveEvent::PendingContentReady => {
+            // The sync run drained its download queue: every queued blob has
+            // completed or failed. Clear any count left standing by drift.
+            state.stats.lock().await.pending_downloads = 0;
+            true
+        }
         LiveEvent::SyncFinished(_) => true,
         LiveEvent::NeighborUp(pk) => {
             {

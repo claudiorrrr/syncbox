@@ -133,19 +133,25 @@ pub fn run() {
                     // Recent movement in *either* direction. last_activity_ms
                     // is bumped on every upload and download; the 1200 ms
                     // window keeps the animation visible after brief bursts.
-                    let recent = {
+                    // pending_downloads covers the long silent stretch while
+                    // iroh-blobs pulls a file's content over the network.
+                    let (recent, pending) = {
                         let s = inner.stats.lock().await;
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_millis() as u64)
                             .unwrap_or(0);
-                        s.last_activity_ms != 0 && now.saturating_sub(s.last_activity_ms) < 1200
+                        (
+                            s.last_activity_ms != 0
+                                && now.saturating_sub(s.last_activity_ms) < 1200,
+                            s.pending_downloads,
+                        )
                     };
                     drop(inner);
 
                     let tray_state = if !configured {
                         TrayState::NotSetup
-                    } else if n > 0 || recent {
+                    } else if n > 0 || pending > 0 || recent {
                         TrayState::Syncing
                     } else {
                         TrayState::InSync
