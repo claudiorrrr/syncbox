@@ -496,9 +496,13 @@ async fn handle_event(state: &SyncState, ev: LiveEvent) -> bool {
 /// repeatedly. Entries whose content hasn't downloaded yet are skipped; a
 /// later ContentReady will trigger another pass.
 async fn reconcile_remote(state: &SyncState) -> Result<()> {
+    // include_empty() is load-bearing: a tombstone is an empty entry, and
+    // single_latest_per_key drops empty entries unless asked to keep them.
+    // Without it, remote deletes never reach apply_remote_delete below and
+    // deleted files linger forever on the receiving device.
     let stream = state
         .doc
-        .get_many(Query::single_latest_per_key())
+        .get_many(Query::single_latest_per_key().include_empty())
         .await
         .context("doc.get_many")?;
     tokio::pin!(stream);
