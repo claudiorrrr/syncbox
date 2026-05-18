@@ -40,13 +40,13 @@ BUNDLE="target/release/bundle/macos"
 APP="$BUNDLE/syncbox.app"
 VERSION="${TAG#v}"
 
-echo "Building signed + notarized release $TAG…"
+echo "Building signed + notarized release $TAG ..."
 bun run tauri build
 
 [ -d "$APP" ] || { echo "build output missing: $APP" >&2; exit 1; }
 
 # Refuse to publish anything that doesn't actually verify.
-echo "Verifying signature + notarization…"
+echo "Verifying signature + notarization ..."
 codesign --verify --strict "$APP"
 xcrun stapler validate "$APP"
 
