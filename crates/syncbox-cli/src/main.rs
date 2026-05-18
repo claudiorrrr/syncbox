@@ -11,7 +11,8 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use iroh_docs::{api::Doc, DocTicket, NamespaceId};
+use futures_lite::StreamExt;
+use iroh_docs::{api::Doc, store::Query, DocTicket, NamespaceId};
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -61,6 +62,8 @@ enum Cmd {
     Run,
     /// Show current configuration and pairing state.
     Status,
+    /// Dump every entry in the synced doc (diagnostics).
+    Dump,
 }
 
 #[tokio::main]
@@ -74,6 +77,7 @@ async fn main() -> Result<()> {
             run_sync().await
         }
         Cmd::Status => do_status().await,
+        Cmd::Dump => do_dump().await,
     }
 }
 
@@ -272,6 +276,48 @@ async fn do_status() -> Result<()> {
     println!(
         "pair server:   {}",
         pair::resolve_server(cfg.pair_server_url.as_deref())
+    );
+    Ok(())
+}
+
+/// Dump every entry in the synced doc — keys, tombstones, hashes, authors.
+async fn do_dump() -> Result<()> {
+    init_tracing();
+    let mut cfg = config::load().await?;
+    let node = spawn_node().await?;
+    let doc = open_doc(&node, &mut cfg)
+        .await?
+        .context("not paired — nothing to dump")?;
+
+    println!("namespace: {}", doc.id());
+    let stream = doc
+        .get_many(Query::single_latest_per_key().include_empty())
+        .await
+        .context("doc.get_many")?;
+    tokio::pin!(stream);
+
+    let (mut files, mut tombs) = (0u32, 0u32);
+    while let Some(entry) = stream.next().await {
+        let entry = entry?;
+        let key = String::from_utf8_lossy(entry.key());
+        let author = entry.author().to_string();
+        let author = &author[..author.len().min(8)];
+        if entry.is_empty() {
+            tombs += 1;
+            println!("  TOMB  {key}  ts={}  author={author}", entry.timestamp());
+        } else {
+            files += 1;
+            let hash = entry.content_hash().to_string();
+            println!(
+                "  FILE  {key}  hash={}  ts={}  author={author}",
+                &hash[..hash.len().min(12)],
+                entry.timestamp()
+            );
+        }
+    }
+    println!(
+        "total: {} ({files} files, {tombs} tombstones)",
+        files + tombs
     );
     Ok(())
 }

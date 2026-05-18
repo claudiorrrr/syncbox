@@ -6209,6 +6209,7 @@ version = "0.2.2"
 dependencies = [
  "anyhow",
  "clap",
+ "futures-lite",
  "iroh",
  "iroh-docs",
  "syncbox-core",

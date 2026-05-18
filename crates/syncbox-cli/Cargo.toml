@@ -15,6 +15,7 @@ iroh = { workspace = true }
 iroh-docs = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
+futures-lite = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
