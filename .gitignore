@@ -28,3 +28,6 @@ target/
 
 # Release credentials for scripts/release.sh — copy from release-env.sh.example.
 /scripts/release-env.sh
+
+# Icon raster — derived from app-icon.svg, regenerate with `tauri icon`.
+/app-icon.png
