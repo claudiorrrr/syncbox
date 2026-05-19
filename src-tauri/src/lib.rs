@@ -583,6 +583,7 @@ async fn maybe_start_sync(app: &AppHandle) -> Result<bool> {
         status,
         log,
         names,
+        fp_cache: Default::default(),
     };
     let handle = tauri::async_runtime::spawn(async move {
         if let Err(e) = sync::run(st, rx).await {

@@ -5,7 +5,6 @@
 //! front-ends on top of these modules.
 
 pub mod config;
-pub mod conflict;
 pub mod ignore_patterns;
 pub mod pair;
 pub mod peer;

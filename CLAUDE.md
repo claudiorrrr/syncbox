@@ -20,9 +20,8 @@ bun run tauri build                     # → target/release/bundle/macos/
 cargo build --release -p syncbox-cli    # → target/release/syncbox
 cargo run -p syncbox-cli -- status      # any subcommand: init/pair/join/run/status
 
-# Tests — only syncbox-core has any (conflict.rs)
-cargo test -p syncbox-core
-cargo test -p syncbox-core conflict::tests::keeps_extension   # single test
+# Tests
+cargo test -p syncbox-core              # syncbox-core currently has none
 
 cargo fmt && cargo clippy --workspace
 
@@ -68,9 +67,8 @@ Key invariants — preserve these when editing `sync.rs`:
 - **Echo guard** (`EchoGuard`): after writing/deleting a file to apply a remote
   change, the path is marked so the watcher recognises its own footprint and
   doesn't bounce the change back.
-- **Conflicts are last-write-wins by mtime.** A local file newer than an
-  incoming entry is kept; the incoming copy lands as
-  `name.conflict-<host>-<ts>.ext` — nothing is destroyed.
+- **Conflicts are last-write-wins by timestamp.** The newer file wins; the
+  older copy is overwritten and discarded — no conflict copies are kept.
 - **Deletes are tombstones** (empty entry). `reconcile_remote` acts only on the
   CRDT's winning entry, so a stale tombstone can't delete a newer edit and a
   stale edit can't resurrect a deleted file. Do *not* re-add mtime comparison in

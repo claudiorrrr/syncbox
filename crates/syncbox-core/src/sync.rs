@@ -9,14 +9,13 @@
 //! * Local edits → `doc.import_file`; remote edits land via `ContentReady`
 //!   and we mirror the doc onto disk. Content is streamed both ways, so
 //!   memory use stays constant regardless of file size.
-//! * Conflict policy is last-write-wins. If a local file is newer than the
-//!   incoming entry, the incoming copy is kept as
-//!   `<name>.conflict-<host>-<ts>.<ext>` — nothing is destroyed.
+//! * Conflict policy is last-write-wins by timestamp: the newer file wins,
+//!   the older copy is discarded — no conflict copies are kept.
 //! * Deletes are tombstones (`doc.del`). An incoming tombstone removes the
 //!   local file, unless the local copy was edited after the delete was
 //!   issued — then the edit wins and is re-published.
 
-use crate::{config, conflict, ignore_patterns::IgnoreSet, peer::Node};
+use crate::{config, ignore_patterns::IgnoreSet, peer::Node};
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use futures_lite::StreamExt;
@@ -115,6 +114,21 @@ pub type StatusLine = Arc<Mutex<String>>;
 /// panel. Newest entries are pushed to the back.
 pub type LogHandle = Arc<Mutex<std::collections::VecDeque<String>>>;
 
+/// Content-hash cache keyed by absolute path. The startup scan and the 30s
+/// sweep hash every file to decide what changed; this lets an unchanged file
+/// — same `(inode, size, mtime)` as last time — skip the read entirely. Held
+/// in memory only; bounded in practice by the synced folder's file count.
+pub type FpCache = Arc<Mutex<HashMap<PathBuf, FpEntry>>>;
+
+/// One cache entry: a cheap change fingerprint plus the hash it produced.
+#[derive(Clone, Copy)]
+pub struct FpEntry {
+    ino: u64,
+    size: u64,
+    mtime_ns: i128,
+    hash: Hash,
+}
+
 const LOG_CAP: usize = 200;
 
 /// Append a timestamped line to the debug log.
@@ -161,6 +175,9 @@ pub struct SyncState {
     /// Endpoint-id (hex) → friendly device name, learned from the reserved
     /// name entries peers publish into the doc.
     pub names: NameMap,
+    /// Per-path content-hash cache; lets the startup scan and the 30s sweep
+    /// skip re-hashing files unchanged since the last pass.
+    pub fp_cache: FpCache,
 }
 
 /// Update the one-line status *and* append it to the debug log.
@@ -511,7 +528,7 @@ async fn under_deleted_dir(doc: &Doc, key: &[u8]) -> bool {
     while let Some(pos) = s[idx..].find('/') {
         let cut = idx + pos;
         // ancestor directory prefix, including the trailing '/'
-        let prefix = s[..=cut].as_bytes().to_vec();
+        let prefix = s.as_bytes()[..=cut].to_vec();
         let mut saw_entry = false;
         let mut all_tombstones = true;
         if let Ok(stream) = doc
@@ -556,7 +573,7 @@ async fn upload_file(state: &SyncState, path: &Path, from_scan: bool) -> Result<
     // Hash the file with constant memory to decide whether it's worth
     // publishing. This is a separate read from the import below, but it lets
     // us skip the (more expensive) import entirely for echoes and no-ops.
-    let want = hash_file(path).await?;
+    let want = hash_file_cached(state, path).await?;
 
     // Echo guard: if the file already matches what we wrote applying a
     // remote change, this event is our own footprint — skip.
@@ -914,7 +931,7 @@ async fn write_entry_to_disk(state: &SyncState, entry: &Entry) -> Result<bool> {
 
     // Disk already matches the doc? Nothing to do. Hashed with constant
     // memory; errors (e.g. file missing) just fall through to the write.
-    if let Ok(local) = hash_file(&abs).await {
+    if let Ok(local) = hash_file_cached(state, &abs).await {
         if local == content_hash {
             return Ok(false);
         }
@@ -922,19 +939,21 @@ async fn write_entry_to_disk(state: &SyncState, entry: &Entry) -> Result<bool> {
 
     let _busy = ActiveGuard::new(&state.active);
 
-    // Last-write-wins. entry timestamps are unix microseconds.
+    // Last-write-wins by timestamp — the newer file wins, the older copy is
+    // discarded. entry timestamps are unix microseconds. If the local file is
+    // strictly newer than the incoming entry, keep the local copy and drop the
+    // incoming version. Otherwise the incoming entry overwrites the local file.
     let entry_ms = entry.timestamp() / 1000;
     let local_mtime = match tokio::fs::metadata(&abs).await {
         Ok(m) => Some(mtime_unix_ms(&m)),
         Err(_) => None,
     };
-    let write_to = match local_mtime {
-        None => abs.clone(),
-        Some(local_ms) if local_ms <= entry_ms => abs.clone(),
-        // Local file is newer than the incoming entry — keep both. The
-        // incoming copy is set aside under a conflict name.
-        Some(_) => conflict::conflict_path(&abs, &state.host),
-    };
+    if let Some(local_ms) = local_mtime {
+        if local_ms > entry_ms {
+            return Ok(false);
+        }
+    }
+    let write_to = abs.clone();
 
     if let Some(parent) = write_to.parent() {
         tokio::fs::create_dir_all(parent).await.ok();
@@ -1006,7 +1025,7 @@ async fn apply_remote_delete(state: &SyncState, key: &[u8]) -> Result<()> {
         guard.insert(abs.clone(), EchoMark::Deleted);
     }
     tokio::fs::remove_file(&abs).await?;
-    prune_empty_dirs(&state.root, &abs).await;
+    prune_empty_dirs(&state.root, &abs, &state.echo).await;
     tracing::info!(path = %rel.display(), "applied remote delete");
     set_status(state, format!("removed {}", rel.display())).await;
     Ok(())
@@ -1016,13 +1035,22 @@ async fn apply_remote_delete(state: &SyncState, key: &[u8]) -> Result<()> {
 /// climbing toward `root`. Stops at `root` (never removed) or the first
 /// directory that still holds something. Without this a remotely-deleted
 /// folder lingers as an empty husk on the receiving device.
-async fn prune_empty_dirs(root: &Path, removed: &Path) {
+///
+/// Each directory is echo-marked before removal: pruning is a *local* husk
+/// cleanup, never a user delete. Unmarked, the watcher would feed the removal
+/// to `handle_local_change`, where `delete_from_doc` enumerates the doc and
+/// tombstones every entry still under the pruned prefix — including sibling
+/// files the doc holds but this device hasn't written to disk yet. That wiped
+/// whole folders on every peer.
+async fn prune_empty_dirs(root: &Path, removed: &Path, echo: &EchoGuard) {
     let mut dir = removed.parent();
     while let Some(d) = dir {
         if d == root || !d.starts_with(root) {
             break;
         }
+        echo.lock().await.insert(d.to_path_buf(), EchoMark::Deleted);
         if !remove_dir_if_empty(d).await {
+            echo.lock().await.remove(d);
             break;
         }
         dir = d.parent();
@@ -1102,6 +1130,42 @@ async fn hash_file(path: &Path) -> Result<Hash> {
         hasher.update(&buf[..n]);
     }
     Ok(Hash::from_bytes(*hasher.finalize().as_bytes()))
+}
+
+/// Cheap change fingerprint: `(inode, size, mtime-in-nanoseconds)`. A file
+/// edited in place keeps its inode but bumps size and/or mtime.
+fn file_fp(meta: &std::fs::Metadata) -> (u64, u64, i128) {
+    use std::os::unix::fs::MetadataExt;
+    let mtime_ns = meta.mtime() as i128 * 1_000_000_000 + meta.mtime_nsec() as i128;
+    (meta.ino(), meta.len(), mtime_ns)
+}
+
+/// `hash_file`, but reuse the cached hash when the file's fingerprint is
+/// unchanged. The full read + hash runs only on a real change — turns the
+/// startup scan and the 30s sweep from "hash every file every pass" into
+/// "hash only what moved".
+async fn hash_file_cached(state: &SyncState, path: &Path) -> Result<Hash> {
+    let meta = tokio::fs::metadata(path).await?;
+    let (ino, size, mtime_ns) = file_fp(&meta);
+    {
+        let cache = state.fp_cache.lock().await;
+        if let Some(e) = cache.get(path) {
+            if e.ino == ino && e.size == size && e.mtime_ns == mtime_ns {
+                return Ok(e.hash);
+            }
+        }
+    }
+    let hash = hash_file(path).await?;
+    state.fp_cache.lock().await.insert(
+        path.to_path_buf(),
+        FpEntry {
+            ino,
+            size,
+            mtime_ns,
+            hash,
+        },
+    );
+    Ok(hash)
 }
 
 /// RAII bump of the in-flight transfer counter; the tray reads it to show
