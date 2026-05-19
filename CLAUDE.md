@@ -74,6 +74,10 @@ Key invariants — preserve these when editing `sync.rs`:
   stale edit can't resurrect a deleted file. Do *not* re-add mtime comparison in
   `apply_remote_delete` — a synced file's mtime is its local write time, not the
   content's logical age (that bug resurrected deleted files).
+- **Empty folders** have no doc entry (only files do), so they can't sync on
+  their own. `scan_local` keeps a `.syncbox-keep` marker file in any subfolder
+  with no real content (`sync_keep_marker`); it is an ordinary synced file, and
+  it's removed once the folder gains real content.
 
 `peer.rs` — `Node` bundles the long-lived iroh handles (`Endpoint`, `FsStore`,
 `Docs`, `Gossip`, `Router`). Keep `Router`/`gossip` alive or the QUIC server stops.

@@ -54,6 +54,13 @@ const SWEEP_SECS: u64 = 30;
 /// these never collide with synced files.
 const NAME_KEY_PREFIX: &[u8] = b"\x00name/";
 
+/// Marker file placed in an otherwise-empty directory so the folder syncs to
+/// peers — iroh-docs stores files only, so an empty directory has no entry and
+/// would never reach a peer. Removed once the folder gains real content. See
+/// `sync_keep_marker`.
+const KEEP_FILE: &str = ".syncbox-keep";
+const KEEP_CONTENT: &[u8] = b"This file lets syncbox keep an otherwise-empty folder in sync.\n";
+
 /// What happened to a path because of a remote action. Stored briefly in the
 /// echo guard so the file watcher can recognise its own footprint and avoid
 /// bouncing the change back across the network.
@@ -685,19 +692,81 @@ async fn scan_local(state: &SyncState) -> Result<()> {
             Ok(rd) => rd,
             Err(_) => continue,
         };
+        // Track whether this directory holds anything real, so we can keep an
+        // empty-folder marker in sync (see `sync_keep_marker`).
+        let mut has_real_content = false;
+        let mut keep: Option<PathBuf> = None;
         while let Some(ent) = rd.next_entry().await? {
             let p = ent.path();
             let ft = ent.file_type().await?;
             if ft.is_dir() {
+                has_real_content = true;
                 stack.push(p);
             } else if ft.is_file() {
+                let name = ent.file_name();
+                if name.to_string_lossy() == KEEP_FILE {
+                    keep = Some(p);
+                    continue;
+                }
+                if !is_os_junk(&name) {
+                    has_real_content = true;
+                }
                 if let Err(e) = handle_local_change(state, &p, true).await {
                     tracing::warn!(path = %p.display(), error = ?e, "scan upload failed");
                 }
             }
         }
+        // The synced root itself never carries a marker — only subfolders.
+        if dir != state.root {
+            sync_keep_marker(state, &dir, has_real_content, keep).await;
+        }
     }
     Ok(())
+}
+
+/// Empty-folder sentinel. iroh-docs stores files only, so an empty directory
+/// has nothing to sync and never reaches a peer. syncbox keeps a marker file
+/// (`.syncbox-keep`) in any subfolder with no real content: it is an ordinary
+/// file, so it syncs, deletes and prunes through the normal path, and a folder
+/// holding only the marker is preserved — the marker isn't OS junk, so
+/// `remove_dir_if_empty` won't prune it. The marker is removed again once the
+/// folder gains real content.
+async fn sync_keep_marker(
+    state: &SyncState,
+    dir: &Path,
+    has_real_content: bool,
+    keep: Option<PathBuf>,
+) {
+    let path = match (has_real_content, keep) {
+        // Folder gained real content — the marker is now clutter; drop it.
+        (true, Some(p)) => {
+            if tokio::fs::remove_file(&p).await.is_err() {
+                return;
+            }
+            p
+        }
+        // Empty folder with no marker — create one so the folder syncs.
+        (false, None) => {
+            let p = dir.join(KEEP_FILE);
+            if tokio::fs::write(&p, KEEP_CONTENT).await.is_err() {
+                return;
+            }
+            p
+        }
+        // Empty folder that already has a marker — make sure it reached the doc.
+        (false, Some(p)) => p,
+        // Ordinary folder, no marker — nothing to do.
+        (true, None) => return,
+    };
+    // Push the create/delete into the doc now: the startup scan runs before
+    // the watcher is live, so we can't count on it noticing. Pass
+    // from_scan=false — this is a deliberate change, not a passive scan
+    // observation, so a fresh marker must out-timestamp any stale tombstone
+    // (e.g. the folder cycled content → empty again) instead of being treated
+    // as a leftover.
+    if let Err(e) = handle_local_change(state, &path, false).await {
+        tracing::warn!(path = %path.display(), error = ?e, "keep marker sync failed");
+    }
 }
 
 // ---------- doc → local ----------
