@@ -372,9 +372,11 @@ async fn delete_from_doc(state: &SyncState, key: &Bytes) -> usize {
         }
         Err(e) => tracing::warn!(error = ?e, "enumerate keys to delete failed"),
     }
-    // Nothing found — still tombstone the exact key, so a file whose entry the
-    // query missed is covered. Harmless if the key is already gone.
-    if victims.is_empty() {
+    // Always tombstone the path itself too. For a directory this is the
+    // folder-level tombstone the startup scan checks before re-publishing a
+    // child (see `under_deleted_dir`); for a file it covers an entry the
+    // enumeration missed.
+    if !victims.iter().any(|v| v == key) {
         victims.push(key.clone());
     }
 
@@ -389,6 +391,34 @@ async fn delete_from_doc(state: &SyncState, key: &Bytes) -> usize {
         }
     }
     removed
+}
+
+/// True if any ancestor directory of `key` carries a tombstone — i.e. a parent
+/// folder was deleted. Lets the startup scan tell a file whose folder is gone
+/// from a genuinely new one, even when the child has no doc entry of its own.
+async fn under_deleted_dir(doc: &Doc, key: &[u8]) -> bool {
+    let Ok(s) = std::str::from_utf8(key) else {
+        return false;
+    };
+    let mut idx = 0;
+    while let Some(pos) = s[idx..].find('/') {
+        let cut = idx + pos;
+        let ancestor = &s[..cut];
+        if let Ok(Some(e)) = doc
+            .get_one(
+                Query::single_latest_per_key()
+                    .key_exact(ancestor.as_bytes())
+                    .include_empty(),
+            )
+            .await
+        {
+            if e.is_empty() {
+                return true;
+            }
+        }
+        idx = cut + 1;
+    }
+    false
 }
 
 /// Publish a single file to the doc. Skips ignored paths, echoes of our own
@@ -443,6 +473,14 @@ async fn upload_file(state: &SyncState, path: &Path, from_scan: bool) -> Result<
             // Already in the doc with the same content — nothing to do.
             return Ok(());
         }
+    }
+
+    // A directory delete tombstones the folder key and clears its children
+    // from the doc, so a child left on disk has no entry of its own and the
+    // check above sees nothing. During the startup scan, treat a file whose
+    // folder was deleted as deleted too — don't resurrect the folder.
+    if from_scan && under_deleted_dir(&state.doc, key.as_ref()).await {
+        return Ok(());
     }
 
     let _busy = ActiveGuard::new(&state.active);
