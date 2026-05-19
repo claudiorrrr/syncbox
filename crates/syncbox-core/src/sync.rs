@@ -42,6 +42,10 @@ const DEBOUNCE_MS: u64 = 250;
 /// After a content event, wait this long for more before reconciling, so a
 /// burst of incoming files collapses into a single disk-reconcile pass.
 const RECONCILE_DEBOUNCE_MS: u64 = 400;
+/// Safety-net interval: re-run a full reconcile + local scan this often, so a
+/// change a dropped watcher or doc event missed still converges in bounded
+/// time. Both passes are idempotent and content-hash gated.
+const SWEEP_SECS: u64 = 30;
 
 /// Key prefix for reserved entries that carry a device's display name. A real
 /// file key is a relative path, which can never start with a NUL byte, so
@@ -206,6 +210,13 @@ pub async fn run(state: SyncState, shutdown: tokio::sync::watch::Receiver<bool>)
     // When set, a disk reconcile is due at this instant (debounced).
     let mut reconcile_at: Option<Instant> = None;
 
+    // Safety-net sweep: every SWEEP_SECS, re-run a full reconcile + local
+    // scan so a change the file watcher or a doc event dropped still
+    // converges within a bounded time. The first tick fires immediately —
+    // consume it, the startup reconcile + scan above already covered it.
+    let mut sweep = tokio::time::interval(Duration::from_secs(SWEEP_SECS));
+    sweep.tick().await;
+
     loop {
         let recon_timer = async {
             match reconcile_at {
@@ -246,6 +257,15 @@ pub async fn run(state: SyncState, shutdown: tokio::sync::watch::Receiver<bool>)
                 reconcile_at = None;
                 if let Err(e) = reconcile_remote(&state).await {
                     tracing::warn!(error = ?e, "reconcile failed");
+                }
+            }
+
+            _ = sweep.tick() => {
+                if let Err(e) = reconcile_remote(&state).await {
+                    tracing::warn!(error = ?e, "periodic reconcile failed");
+                }
+                if let Err(e) = scan_local(&state).await {
+                    tracing::warn!(error = ?e, "periodic scan failed");
                 }
             }
         }
