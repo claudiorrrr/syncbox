@@ -417,14 +417,18 @@ async fn handle_local_change(state: &SyncState, path: &Path, from_scan: bool) ->
 }
 
 /// Tombstone a removed path in the doc. A removed file tombstones its own
-/// key; a removed directory tombstones every file key beneath it.
+/// key; a removed directory tombstones every file key beneath it — but never
+/// the directory key itself.
 ///
-/// We `doc.del` each *exact* key rather than relying on `doc.del`'s prefix
-/// form, because iroh-docs' prefix delete only clears entries authored by
-/// *this* device (`remove_prefix_filtered` is author-scoped). Files an earlier
-/// session — or the other peer — published live under a different author and
-/// would survive a directory-level delete, resurrecting the folder. An
-/// exact-key tombstone, by contrast, wins by timestamp across every author.
+/// We `doc.del` each *exact child* key rather than `doc.del`-ing the directory
+/// key, for two reasons. First, iroh-docs' prefix delete only clears entries
+/// authored by *this* device (`remove_prefix_filtered` is author-scoped), so a
+/// directory-level delete leaves the other peer's files alive and resurrects
+/// the folder. Second — and worse — `doc.del` on a directory key is itself a
+/// prefix delete: it would wipe the child tombstones we just wrote (same
+/// author, older timestamp), so the peer's non-empty children win again. An
+/// exact child-key tombstone wins by timestamp across every author and touches
+/// nothing else.
 async fn delete_from_doc(state: &SyncState, key: &Bytes) -> usize {
     let kb: &[u8] = key.as_ref();
     let mut victims: Vec<Bytes> = Vec::new();
@@ -452,12 +456,31 @@ async fn delete_from_doc(state: &SyncState, key: &Bytes) -> usize {
         }
         Err(e) => tracing::warn!(error = ?e, "enumerate keys to delete failed"),
     }
-    // Always tombstone the path itself too. For a directory this is the
-    // folder-level tombstone the startup scan checks before re-publishing a
-    // child (see `under_deleted_dir`); for a file it covers an entry the
-    // enumeration missed.
-    if !victims.iter().any(|v| v == key) {
-        victims.push(key.clone());
+    // The enumeration above already covers the path's own entry — a file key
+    // matches its own prefix. If nothing was found, tombstone the bare key,
+    // but only when it is *not* a directory: `doc.del` on a directory key is a
+    // prefix delete whose `remove_prefix_filtered` would wipe child tombstones
+    // (this author, older timestamp), letting the peer's non-empty children
+    // win and resurrect the folder. A directory is any key with entries below
+    // "<key>/".
+    if victims.is_empty() {
+        let mut prefix = Vec::with_capacity(kb.len() + 1);
+        prefix.extend_from_slice(kb);
+        prefix.push(b'/');
+        let is_dir = matches!(
+            state
+                .doc
+                .get_one(
+                    Query::single_latest_per_key()
+                        .key_prefix(prefix)
+                        .include_empty(),
+                )
+                .await,
+            Ok(Some(_))
+        );
+        if !is_dir {
+            victims.push(key.clone());
+        }
     }
 
     let mut removed = 0;
@@ -473,9 +496,13 @@ async fn delete_from_doc(state: &SyncState, key: &Bytes) -> usize {
     removed
 }
 
-/// True if any ancestor directory of `key` carries a tombstone — i.e. a parent
-/// folder was deleted. Lets the startup scan tell a file whose folder is gone
-/// from a genuinely new one, even when the child has no doc entry of its own.
+/// True if `key`'s parent folder was deleted. A directory has no doc entry of
+/// its own (only files do), so a removed folder shows up as: the doc has
+/// entries directly beneath some ancestor's `<dir>/` prefix and every one of
+/// them is a tombstone. `delete_from_doc` tombstones every child of a deleted
+/// folder, so this holds for the whole subtree. Lets the startup scan tell a
+/// leftover file inside a deleted folder from a genuinely new one, even when
+/// the child has no doc entry of its own.
 async fn under_deleted_dir(doc: &Doc, key: &[u8]) -> bool {
     let Ok(s) = std::str::from_utf8(key) else {
         return false;
@@ -483,18 +510,30 @@ async fn under_deleted_dir(doc: &Doc, key: &[u8]) -> bool {
     let mut idx = 0;
     while let Some(pos) = s[idx..].find('/') {
         let cut = idx + pos;
-        let ancestor = &s[..cut];
-        if let Ok(Some(e)) = doc
-            .get_one(
+        // ancestor directory prefix, including the trailing '/'
+        let prefix = s[..=cut].as_bytes().to_vec();
+        let mut saw_entry = false;
+        let mut all_tombstones = true;
+        if let Ok(stream) = doc
+            .get_many(
                 Query::single_latest_per_key()
-                    .key_exact(ancestor.as_bytes())
+                    .key_prefix(prefix)
                     .include_empty(),
             )
             .await
         {
-            if e.is_empty() {
-                return true;
+            tokio::pin!(stream);
+            while let Some(entry) = stream.next().await {
+                let Ok(entry) = entry else { continue };
+                saw_entry = true;
+                if !entry.is_empty() {
+                    all_tombstones = false;
+                    break;
+                }
             }
+        }
+        if saw_entry && all_tombstones {
+            return true;
         }
         idx = cut + 1;
     }
