@@ -378,7 +378,23 @@ async fn handle_local_change(state: &SyncState, path: &Path, from_scan: bool) ->
                 return Ok(());
             }
         }
-        let removed = delete_from_doc(state, &key).await;
+        let mut removed = delete_from_doc(state, &key).await;
+        // If the file's folder vanished too, the whole folder was deleted.
+        // Tombstone every gone ancestor directory: macOS reports a folder
+        // delete as individual file removals, so without this the folder key
+        // never gets a tombstone — and that folder-level tombstone is what
+        // stops a peer's scan from re-publishing children whose own entries
+        // the delete cleared from the doc.
+        let mut dir = path.parent();
+        while let Some(d) = dir {
+            if d == state.root || !d.starts_with(&state.root) || d.exists() {
+                break;
+            }
+            if let Ok(drel) = d.strip_prefix(&state.root) {
+                removed += delete_from_doc(state, &rel_to_key(drel)).await;
+            }
+            dir = d.parent();
+        }
         if removed > 0 {
             tracing::info!(path = %rel.display(), removed, "propagated local delete");
             set_status(state, format!("deleted {}", rel.display())).await;
