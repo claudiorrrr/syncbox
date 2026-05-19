@@ -1,8 +1,9 @@
 // Frontend glue for the syncbox tray window.
 //
 // All persistent state lives in the Rust side. This file mirrors what the
-// backend reports and calls back into it. The window has four views — folder
-// setup, add-a-device, running, settings — and shows exactly one at a time.
+// backend reports and calls back into it. A device can sync several folders;
+// the window shows one folder at a time and switches between them. The four
+// views — add-a-folder, running, add-a-device, settings — show one at a time.
 
 const { invoke } = window.__TAURI__.core;
 const el = (id) => document.getElementById(id);
@@ -15,19 +16,12 @@ const els = {
   btnBack: el("btn-back"),
   btnSettings: el("btn-settings"),
 
+  folderStep: el("folder-step"),
+  folderTitle: el("folder-title"),
+  folderChoice: el("folder-choice"),
   btnChooseFolder: el("btn-choose-folder"),
-
-  adddeviceStep: el("adddevice-step"),
-  adddeviceChoice: el("adddevice-choice"),
-  btnShowCode: el("btn-show-code"),
-  btnEnterCode: el("btn-enter-code"),
-  panelShowCode: el("panel-show-code"),
-  panelEnterCode: el("panel-enter-code"),
-  ourCode: el("our-code"),
-  codeExpiry: el("code-expiry"),
-  btnMakeCode: el("btn-make-code"),
-  btnCopyCode: el("btn-copy-code"),
-  ticketReadOnly: el("ticket-read-only"),
+  btnFolderEnterCode: el("btn-folder-enter-code"),
+  folderEnterPanel: el("folder-enter-panel"),
   joinCode: el("join-code"),
   btnUseCode: el("btn-use-code"),
   pairResult: el("pair-result"),
@@ -36,15 +30,22 @@ const els = {
   statusLine: el("status-line"),
   statusSub: el("status-sub"),
   runFolder: el("run-folder"),
+  folderSwitch: el("folder-switch"),
   runOwner: el("run-owner"),
   deviceList: el("device-list"),
   noDevices: el("no-devices"),
   btnAddDevice: el("btn-add-device"),
 
+  adddeviceFolder: el("adddevice-folder"),
+  ourCode: el("our-code"),
+  codeExpiry: el("code-expiry"),
+  btnMakeCode: el("btn-make-code"),
+  btnCopyCode: el("btn-copy-code"),
+  ticketReadOnly: el("ticket-read-only"),
+
   deviceName: el("device-name"),
-  folderPath: el("folder-path"),
-  btnChooseFolder2: el("btn-choose-folder-2"),
-  btnOpenFolder: el("btn-open-folder"),
+  folderList: el("folder-list"),
+  btnAddFolder: el("btn-add-folder"),
   autostart: el("autostart"),
   hideDock: el("hide-dock"),
   readOnlyLocal: el("read-only-local"),
@@ -70,51 +71,61 @@ function formatBytes(n) {
   return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
-// ---------- view switching ----------
+// ---------- state ----------
 
 const views = {
   folder: el("view-folder"),
-  adddevice: el("view-adddevice"),
   running: el("view-running"),
+  adddevice: el("view-adddevice"),
   settings: el("view-settings"),
 };
 
-// 'settings' / 'adddevice' when the user navigated there; null = let the
-// current sync state decide (setup steps vs running).
+// The list of synced folders (from cmd_list_folders) and which one the window
+// is currently showing.
+let folders = [];
+let current = 0;
+
+// 'settings' / 'adddevice' / 'addfolder' when the user navigated there;
+// null = let the folder list decide (setup vs running).
 let viewOverride = null;
+let folderPanel = "choice"; // 'choice' | 'enter' — sub-panel of the folder view
 let lastView = null;
-let addPanel = "choice"; // 'choice' | 'show' | 'enter'
 let lastStatus = null;
 let lastXfer = null;
 
 function pickView(s) {
   if (viewOverride === "settings") return "settings";
+  if (viewOverride === "addfolder") return "folder";
   if (viewOverride === "adddevice") return "adddevice";
-  if (!s || !s.folder) return "folder";
-  if (!s.paired) return "adddevice";
+  if (folders.length === 0) return "folder";
   return "running";
-}
-
-function renderAddPanel() {
-  els.adddeviceChoice.hidden = addPanel !== "choice";
-  els.panelShowCode.hidden = addPanel !== "show";
-  els.panelEnterCode.hidden = addPanel !== "enter";
 }
 
 function render(s) {
   const v = pickView(s);
   for (const name in views) views[name].hidden = name !== v;
+
   // Header buttons keep their slot (visibility, not display) so the title
-  // stays centered.
+  // stays centered. Settings gear only on the running view; Back whenever
+  // the user navigated into a screen they can leave.
   els.btnSettings.classList.toggle("invisible", v !== "running");
-  const showBack = v === "settings" || (v === "adddevice" && s && s.paired);
+  const showBack =
+    v === "settings" ||
+    v === "adddevice" ||
+    (v === "folder" && viewOverride === "addfolder");
   els.btnBack.classList.toggle("invisible", !showBack);
-  // "Step 2 of 2" only while add-a-device IS the setup (not yet paired).
-  els.adddeviceStep.hidden = !(v === "adddevice" && s && !s.paired);
-  // Reset the add-device sub-panel only when first entering the view.
-  if (v === "adddevice" && lastView !== "adddevice") {
-    addPanel = "choice";
-    renderAddPanel();
+
+  if (v === "folder") {
+    // "Step 1" only on the very first run (no folders yet).
+    els.folderStep.hidden = folders.length !== 0;
+    els.folderTitle.textContent =
+      viewOverride === "addfolder" ? "Sync another folder" : "Sync a folder";
+    els.folderChoice.hidden = folderPanel !== "choice";
+    els.folderEnterPanel.hidden = folderPanel !== "enter";
+  }
+  if (v === "adddevice") {
+    const f = folders[current];
+    els.adddeviceFolder.textContent = f ? f.name : "this folder";
   }
   lastView = v;
 }
@@ -125,48 +136,91 @@ els.btnSettings.addEventListener("click", () => {
 });
 els.btnBack.addEventListener("click", () => {
   viewOverride = null;
+  folderPanel = "choice";
   render(lastStatus);
 });
 els.btnAddDevice.addEventListener("click", () => {
   viewOverride = "adddevice";
+  els.ourCode.textContent = "— — —";
+  els.codeExpiry.textContent = "";
   render(lastStatus);
 });
-els.btnShowCode.addEventListener("click", () => {
-  // Pin the view: generating a code creates the doc, which flips `paired`
-  // true — without the pin the window would jump to "running" while the
-  // user is still reading the code to type into the other Mac.
-  viewOverride = "adddevice";
-  addPanel = "show";
-  renderAddPanel();
+els.btnAddFolder.addEventListener("click", () => {
+  viewOverride = "addfolder";
+  folderPanel = "choice";
+  render(lastStatus);
 });
-els.btnEnterCode.addEventListener("click", () => {
-  viewOverride = "adddevice";
-  addPanel = "enter";
-  renderAddPanel();
+els.btnFolderEnterCode.addEventListener("click", () => {
+  folderPanel = "enter";
+  render(lastStatus);
 });
-document.querySelectorAll(".adddevice-back").forEach((b) =>
+document.querySelectorAll(".folder-back").forEach((b) =>
   b.addEventListener("click", () => {
-    addPanel = "choice";
-    renderAddPanel();
+    folderPanel = "choice";
+    render(lastStatus);
   }),
 );
+
+els.folderSwitch.addEventListener("change", () => {
+  const i = parseInt(els.folderSwitch.value, 10);
+  if (!Number.isNaN(i)) {
+    current = i;
+    refresh();
+  }
+});
 
 // ---------- status ----------
 
 async function refresh() {
   try {
-    const s = await invoke("cmd_get_status");
-    lastStatus = s;
-    els.folderPath.textContent = s.folder || "(not set)";
-    els.btnOpenFolder.hidden = !s.folder;
-    if (s.version) els.appVersion.textContent = `v${s.version}`;
-    render(s);
+    folders = await invoke("cmd_list_folders");
+  } catch (e) {
+    els.statusLine.textContent = `error: ${e}`;
+    return;
+  }
+  if (current >= folders.length) current = Math.max(0, folders.length - 1);
+
+  let s = null;
+  if (folders.length > 0) {
+    try {
+      s = await invoke("cmd_get_status", { idx: current });
+    } catch {
+      /* keep last */
+    }
+  }
+  lastStatus = s;
+  if (s && s.version) els.appVersion.textContent = `v${s.version}`;
+
+  render(s);
+  renderFolderSwitch();
+  renderFolderListSettings();
+  if (s) {
     await refreshDevices(s);
     await refreshTransfer();
     updateHero(s, lastXfer);
-    await refreshStorage();
-  } catch (e) {
-    els.statusLine.textContent = `error: ${e}`;
+  }
+  await refreshStorage();
+}
+
+// The folder name in the running view doubles as a switcher once there are
+// two or more folders; with one it's plain text, exactly as a single-folder
+// install looked before.
+function renderFolderSwitch() {
+  if (folders.length >= 2) {
+    els.runFolder.hidden = true;
+    els.folderSwitch.hidden = false;
+    els.folderSwitch.innerHTML = "";
+    for (const f of folders) {
+      const o = document.createElement("option");
+      o.value = String(f.index);
+      o.textContent = f.name;
+      if (f.index === current) o.selected = true;
+      els.folderSwitch.appendChild(o);
+    }
+  } else {
+    els.folderSwitch.hidden = true;
+    els.runFolder.hidden = false;
+    els.runFolder.textContent = folders[current] ? folders[current].name : "folder";
   }
 }
 
@@ -205,20 +259,13 @@ function updateHero(s, xfer) {
   els.statusSub.textContent = sub;
 }
 
-function folderBaseName(path) {
-  if (!path) return "folder";
-  const parts = path.replace(/\/+$/, "").split("/").filter(Boolean);
-  return parts.length ? parts[parts.length - 1] : path;
-}
-
 async function refreshDevices(s) {
-  els.runFolder.textContent = folderBaseName(s.folder);
   els.runOwner.textContent = s.is_owner ? "You own this folder" : "";
   els.runOwner.hidden = !s.is_owner;
   try {
     // The list is the whole swarm — every device that shares this folder.
     // The backend already hides devices we've stopped syncing with.
-    const peers = await invoke("cmd_get_peers");
+    const peers = await invoke("cmd_get_peers", { idx: current });
     renderDevices(
       peers.map((p) => ({
         id: p.id,
@@ -306,6 +353,62 @@ async function stopSyncing(d) {
   }
 }
 
+// ---------- settings: folder list ----------
+
+function renderFolderListSettings() {
+  els.folderList.innerHTML = "";
+  for (const f of folders) {
+    const li = document.createElement("li");
+    li.className = "device";
+    const icon = document.createElement("span");
+    icon.textContent = "📁";
+    icon.style.flexShrink = "0";
+    const name = document.createElement("span");
+    name.className = "dname";
+    name.textContent = f.path || `${f.name} (no local folder yet)`;
+    li.append(icon, name);
+
+    if (f.path) {
+      const reveal = document.createElement("button");
+      reveal.className = "link tiny";
+      reveal.textContent = "Reveal";
+      reveal.style.flexShrink = "0";
+      reveal.addEventListener("click", () =>
+        invoke("cmd_open_folder", { idx: f.index }),
+      );
+      li.append(reveal);
+    }
+    const remove = document.createElement("button");
+    remove.className = "link tiny dremove";
+    remove.textContent = "Stop syncing";
+    remove.addEventListener("click", () => removeFolder(f));
+    li.append(remove);
+    els.folderList.appendChild(li);
+  }
+}
+
+async function removeFolder(f) {
+  const ok = await window.__TAURI__.dialog.ask(
+    `Stop syncing the folder "${f.name}"?\n\n` +
+      "syncbox stops tracking it. The files stay on this Mac — nothing is " +
+      "deleted. Other devices keep their copies.",
+    {
+      title: "Stop syncing folder",
+      kind: "warning",
+      okLabel: "Stop syncing",
+      cancelLabel: "Cancel",
+    },
+  );
+  if (!ok) return;
+  try {
+    await invoke("cmd_remove_folder", { idx: f.index });
+    if (current >= f.index && current > 0) current -= 1;
+    refresh();
+  } catch (e) {
+    alert(`Could not stop syncing the folder: ${e}`);
+  }
+}
+
 async function refreshStorage() {
   try {
     const bytes = await invoke("cmd_get_storage_size");
@@ -317,7 +420,7 @@ async function refreshStorage() {
 
 async function refreshTransfer() {
   try {
-    lastXfer = await invoke("cmd_get_transfer_stats");
+    lastXfer = await invoke("cmd_get_transfer_stats", { idx: current });
   } catch {
     /* keep last */
   }
@@ -350,26 +453,61 @@ function showPairResult(node, ok, msg) {
   node.className = `pair-result ${ok ? "ok" : "err"}`;
 }
 
-// ---------- folder ----------
+// ---------- add a folder ----------
 
-async function chooseFolder() {
+// Pick a local folder. `idx` null adds a new folder; a number sets the local
+// path of an already-joined folder. After it lands, show that folder.
+async function pickFolder(idx) {
   try {
-    await invoke("cmd_choose_folder");
-    refresh();
+    const newIdx = await invoke("cmd_pick_folder", { idx: idx ?? null });
+    if (newIdx === null || newIdx === undefined) return false;
+    current = newIdx;
+    viewOverride = null;
+    folderPanel = "choice";
+    await refresh();
+    return true;
   } catch (e) {
-    alert(`Could not pick folder: ${e}`);
+    alert(`Could not add the folder: ${e}`);
+    return false;
   }
 }
-els.btnChooseFolder.addEventListener("click", chooseFolder);
-els.btnChooseFolder2.addEventListener("click", chooseFolder);
-els.btnOpenFolder.addEventListener("click", () => invoke("cmd_open_folder"));
 
-// ---------- add a device ----------
+els.btnChooseFolder.addEventListener("click", () => pickFolder(null));
+
+els.btnUseCode.addEventListener("click", async () => {
+  const code = els.joinCode.value.trim();
+  if (!code) return;
+  els.btnUseCode.disabled = true;
+  showPairResult(els.pairResult, true, "Connecting…");
+  try {
+    const idx = await invoke("cmd_use_code", { code });
+    els.joinCode.value = "";
+    // A joined folder has no local path yet — ask where to put it.
+    const f = (await invoke("cmd_list_folders"))[idx];
+    if (f && !f.path) {
+      showPairResult(els.pairResult, true, "Connected — choose where to keep it.");
+      await pickFolder(idx);
+    } else {
+      current = idx;
+      viewOverride = null;
+      folderPanel = "choice";
+      await refresh();
+    }
+  } catch (e) {
+    showPairResult(els.pairResult, false, `${e}`);
+  } finally {
+    els.btnUseCode.disabled = false;
+  }
+});
+
+// ---------- add a device (share the current folder) ----------
 
 els.btnMakeCode.addEventListener("click", async () => {
+  if (!folders[current]) return;
   els.btnMakeCode.disabled = true;
   try {
     const r = await invoke("cmd_make_code", {
+      idx: current,
       readOnly: els.ticketReadOnly.checked,
     });
     els.ourCode.textContent = r.code;
@@ -390,24 +528,6 @@ els.btnCopyCode.addEventListener("click", async () => {
     setTimeout(() => (els.btnCopyCode.textContent = "Copy"), 1200);
   } catch {
     /* clipboard denied */
-  }
-});
-
-els.btnUseCode.addEventListener("click", async () => {
-  const code = els.joinCode.value.trim();
-  if (!code) return;
-  els.btnUseCode.disabled = true;
-  showPairResult(els.pairResult, true, "Connecting…");
-  try {
-    await invoke("cmd_use_code", { code });
-    els.joinCode.value = "";
-    showPairResult(els.pairResult, true, "Connected. Syncing will start.");
-    viewOverride = null;
-    refresh();
-  } catch (e) {
-    showPairResult(els.pairResult, false, `${e}`);
-  } finally {
-    els.btnUseCode.disabled = false;
   }
 });
 
@@ -454,13 +574,16 @@ els.readOnlyLocal.addEventListener("change", async () => {
 });
 
 els.btnWriteIgnore.addEventListener("click", async () => {
+  if (!folders[current]) return;
   try {
-    const created = await invoke("cmd_write_default_ignore");
+    const created = await invoke("cmd_write_default_ignore", { idx: current });
     els.btnWriteIgnore.textContent = created
       ? "Created — open it in your editor"
       : "Already exists";
     setTimeout(
-      () => (els.btnWriteIgnore.textContent = "Create .syncboxignore in folder"),
+      () =>
+        (els.btnWriteIgnore.textContent =
+          "Create .syncboxignore in the current folder"),
       1500,
     );
   } catch (e) {
@@ -469,9 +592,10 @@ els.btnWriteIgnore.addEventListener("click", async () => {
 });
 
 els.btnMakeTicket.addEventListener("click", async () => {
+  if (!folders[current]) return;
   els.btnMakeTicket.disabled = true;
   try {
-    els.ourTicket.value = await invoke("cmd_get_ticket");
+    els.ourTicket.value = await invoke("cmd_get_ticket", { idx: current });
     refresh();
   } catch (e) {
     alert(`Could not get ticket: ${e}`);
@@ -497,11 +621,17 @@ els.btnJoin.addEventListener("click", async () => {
   els.btnJoin.disabled = true;
   showPairResult(els.pairResultAdv, true, "Joining…");
   try {
-    await invoke("cmd_join_with_ticket", { ticket: t });
+    const idx = await invoke("cmd_join_with_ticket", { ticket: t });
     els.joinTicket.value = "";
-    showPairResult(els.pairResultAdv, true, "Joined. Connecting…");
-    viewOverride = null;
-    refresh();
+    showPairResult(els.pairResultAdv, true, "Joined.");
+    const f = (await invoke("cmd_list_folders"))[idx];
+    if (f && !f.path) {
+      await pickFolder(idx);
+    } else {
+      current = idx;
+      viewOverride = null;
+      refresh();
+    }
   } catch (e) {
     showPairResult(els.pairResultAdv, false, `${e}`);
   } finally {

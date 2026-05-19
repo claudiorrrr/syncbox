@@ -7,7 +7,7 @@ use anyhow::Result;
 use iroh_docs::{api::Doc, AuthorId, DocTicket, NamespaceId};
 use serde::Serialize;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     path::PathBuf,
     str::FromStr,
     sync::{atomic::AtomicU32, Arc},
@@ -25,7 +25,25 @@ use tauri::{
 };
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_dialog::DialogExt;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
+
+/// Per-folder runtime handles. The `folders` Vec runs parallel to
+/// `config.folders` — entry `i` here is the live state for `config.folders[i]`.
+/// Created at bootstrap and when a folder is added; dropped on removal.
+#[derive(Default)]
+struct FolderRuntime {
+    doc: Option<Doc>,
+    echo: EchoGuard,
+    peers: PeerMap,
+    names: NameMap,
+    /// Cached IgnoreSet for this folder, from its `.syncboxignore`.
+    ignores: Option<Arc<IgnoreSet>>,
+    active: Arc<AtomicU32>,
+    stats: StatsHandle,
+    status: StatusLine,
+    shutdown: Option<watch::Sender<bool>>,
+    sync_handle: Option<tauri::async_runtime::JoinHandle<()>>,
+}
 
 /// All the runtime handles the Tauri commands need to touch. Kept behind a
 /// single Mutex because most operations are user-initiated and rare.
@@ -34,19 +52,18 @@ struct Inner {
     config: config::Config,
     node: Option<Arc<Node>>,
     author: Option<AuthorId>,
-    doc: Option<Doc>,
-    echo: Option<EchoGuard>,
-    peers: Option<PeerMap>,
-    names: Option<NameMap>,
+    /// One runtime per synced folder, index-aligned with `config.folders`.
+    folders: Vec<FolderRuntime>,
+    /// Stop-syncing list — device-global, applies to every folder.
     blocked: Arc<Mutex<HashSet<String>>>,
-    active: Arc<AtomicU32>,
-    stats: StatsHandle,
-    status: StatusLine,
+    /// Debug log ring buffer — device-global, shared by all folders.
     log: LogHandle,
-    /// Cached IgnoreSet — rebuilt whenever the user picks a different folder.
-    ignores: Option<Arc<IgnoreSet>>,
-    shutdown: Option<watch::Sender<bool>>,
-    sync_handle: Option<tauri::async_runtime::JoinHandle<()>>,
+}
+
+impl Inner {
+    fn folder_mut(&mut self, idx: usize) -> Option<&mut FolderRuntime> {
+        self.folders.get_mut(idx)
+    }
 }
 
 pub struct AppState {
@@ -135,31 +152,38 @@ pub fn run() {
                     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                     let state: State<AppState> = handle.state();
                     let inner = state.inner.lock().await;
-                    let n = inner.active.load(std::sync::atomic::Ordering::Relaxed);
-                    let configured = inner.doc.is_some()
-                        && inner
+                    // Aggregate over every folder: the tray icon shows the
+                    // busiest state across all of them.
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let mut configured = false;
+                    let mut n = 0u32;
+                    let mut pending = 0u32;
+                    let mut recent = false;
+                    for (i, rt) in inner.folders.iter().enumerate() {
+                        n += rt.active.load(std::sync::atomic::Ordering::Relaxed);
+                        let has_path = inner
                             .config
-                            .primary()
+                            .folders
+                            .get(i)
                             .and_then(|f| f.path.as_ref())
-                            .is_some()
-                        && inner.sync_handle.is_some();
-                    // Recent movement in *either* direction. last_activity_ms
-                    // is bumped on every upload and download; the 1200 ms
-                    // window keeps the animation visible after brief bursts.
-                    // pending_downloads covers the long silent stretch while
-                    // iroh-blobs pulls a file's content over the network.
-                    let (recent, pending) = {
-                        let s = inner.stats.lock().await;
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as u64)
-                            .unwrap_or(0);
-                        (
-                            s.last_activity_ms != 0
-                                && now.saturating_sub(s.last_activity_ms) < 1200,
-                            s.pending_downloads,
-                        )
-                    };
+                            .is_some();
+                        if rt.doc.is_some() && has_path && rt.sync_handle.is_some() {
+                            configured = true;
+                        }
+                        // last_activity_ms is bumped on every upload and
+                        // download; the 1200 ms window keeps the animation
+                        // visible after brief bursts. pending_downloads covers
+                        // the silent stretch while iroh-blobs pulls content.
+                        let s = rt.stats.lock().await;
+                        if s.last_activity_ms != 0 && now.saturating_sub(s.last_activity_ms) < 1200
+                        {
+                            recent = true;
+                        }
+                        pending += s.pending_downloads;
+                    }
                     drop(inner);
 
                     let tray_state = if !configured {
@@ -196,16 +220,17 @@ pub fn run() {
                     tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     let state: State<AppState> = handle.state();
                     let mut inner = state.inner.lock().await;
-                    let Some(peers) = inner.peers.clone() else {
-                        continue;
-                    };
-                    let online: Vec<String> = {
-                        let p = peers.lock().await;
-                        p.iter()
-                            .filter(|(_, e)| e.online)
-                            .map(|(id, _)| id.clone())
-                            .collect()
-                    };
+                    // Union of online peers across every folder.
+                    let peer_maps: Vec<PeerMap> =
+                        inner.folders.iter().map(|f| f.peers.clone()).collect();
+                    let mut online: Vec<String> = Vec::new();
+                    for pm in &peer_maps {
+                        for (id, e) in pm.lock().await.iter() {
+                            if e.online && !online.contains(id) {
+                                online.push(id.clone());
+                            }
+                        }
+                    }
                     if online.is_empty() {
                         continue;
                     }
@@ -241,7 +266,9 @@ pub fn run() {
             cmd_use_code,
             cmd_get_pair_server,
             cmd_set_pair_server,
-            cmd_choose_folder,
+            cmd_list_folders,
+            cmd_pick_folder,
+            cmd_remove_folder,
             cmd_open_folder,
             cmd_set_autostart,
             cmd_get_autostart,
@@ -384,15 +411,42 @@ fn status_icon(state: TrayState, frame: u32) -> (Vec<u8>, u32, u32) {
     (buf, S as u32, S as u32)
 }
 
+/// Re-open a folder's doc on cold start. Tries `open(namespace_id)` first
+/// (cheap, attaches to the local replica); falls back to `import(ticket)` for
+/// the device joining for the first time. Updates `folder.namespace_id` if the
+/// import path discovered it — the caller is responsible for saving config.
+async fn open_doc(node: &Node, folder: &mut config::FolderConfig) -> Option<Doc> {
+    if let Some(id_str) = &folder.namespace_id {
+        if let Ok(id) = NamespaceId::from_str(id_str) {
+            match node.docs.open(id).await {
+                Ok(Some(d)) => return Some(d),
+                Ok(None) => tracing::warn!(id = %id_str, "doc not found locally"),
+                Err(e) => tracing::warn!(error = ?e, "docs.open failed"),
+            }
+        }
+    }
+    if let Some(t) = folder.doc_ticket.clone() {
+        if let Ok(ticket) = DocTicket::from_str(&t) {
+            match node.docs.import(ticket).await {
+                Ok(d) => {
+                    folder.namespace_id = Some(d.id().to_string());
+                    return Some(d);
+                }
+                Err(e) => tracing::warn!(error = ?e, "doc import failed"),
+            }
+        }
+    }
+    None
+}
+
 async fn bootstrap(app: &AppHandle) -> Result<()> {
     let state: State<AppState> = app.state();
-    let cfg = config::load().await?;
+    let mut cfg = config::load().await?;
 
     // First run / setup not finished: the window is hidden by default (tray
-    // app), but with no folder picked the user has nothing to click and can't
-    // tell syncbox is even running. Surface the window so they can pick a
-    // folder and pair. A configured install stays quietly in the tray.
-    if cfg.primary().and_then(|f| f.path.as_ref()).is_none() {
+    // app), but with nothing set up the user can't tell syncbox is running.
+    // Surface the window. A configured install stays quietly in the tray.
+    if cfg.folders.iter().all(|f| f.path.is_none()) {
         if let Some(win) = app.get_webview_window("main") {
             let _ = win.show();
             let _ = win.set_focus();
@@ -410,84 +464,47 @@ async fn bootstrap(app: &AppHandle) -> Result<()> {
     // author each run cannot delete folders an earlier run published.
     let author = node.docs.author_default().await?;
 
-    let mut inner = state.inner.lock().await;
-    inner.config = cfg.clone();
-    inner.node = Some(node.clone());
-    inner.author = Some(author);
-    inner.echo = Some(Arc::new(Mutex::new(Default::default())));
-    inner.peers = Some(Arc::new(Mutex::new(HashMap::new())));
-    inner.names = Some(Arc::new(Mutex::new(HashMap::new())));
+    // Build one runtime per synced folder: load its ignore set, re-open its
+    // doc, and rejoin known peers so the first connection skips discovery.
+    let mut runtimes: Vec<FolderRuntime> = Vec::with_capacity(cfg.folders.len());
+    for fc in &mut cfg.folders {
+        let mut rt = FolderRuntime::default();
+        if let Some(path) = &fc.path {
+            match IgnoreSet::load(path) {
+                Ok(s) => rt.ignores = Some(Arc::new(s)),
+                Err(e) => tracing::warn!(error = ?e, "could not load ignore set"),
+            }
+        }
+        if let Some(doc) = open_doc(&node, fc).await {
+            if !cfg.known_peers.is_empty() {
+                if let Err(e) = doc.start_sync(cfg.known_peers.clone()).await {
+                    tracing::warn!(error = ?e, "start_sync with known peers failed");
+                }
+            }
+            rt.doc = Some(doc);
+        }
+        runtimes.push(rt);
+    }
+    // `open_doc` may have discovered namespace ids via import; persist them
+    // (this also writes back any legacy single-folder config migration).
+    if let Err(e) = config::save(&cfg).await {
+        tracing::warn!(error = ?e, "save config failed");
+    }
+
     {
-        let mut blocked = inner.blocked.lock().await;
-        blocked.extend(cfg.blocked_peers.iter().cloned());
-    }
-    if let Some(folder) = cfg.primary().and_then(|f| f.path.as_ref()) {
-        match IgnoreSet::load(folder) {
-            Ok(s) => inner.ignores = Some(Arc::new(s)),
-            Err(e) => tracing::warn!(error = ?e, "could not load ignore set"),
+        let mut inner = state.inner.lock().await;
+        inner.node = Some(node);
+        inner.author = Some(author);
+        inner.folders = runtimes;
+        {
+            let mut blocked = inner.blocked.lock().await;
+            blocked.extend(cfg.blocked_peers.iter().cloned());
         }
+        inner.config = cfg;
     }
 
-    // Re-open the persistent doc on cold start. Order: try `open(id)` first
-    // (cheap, just attaches to local replica). If we don't yet have an id
-    // persisted but do have a ticket, fall through to `import(ticket)` —
-    // this is the path on the device that joins for the first time.
-    let mut opened: Option<Doc> = None;
-    let cfg_namespace = cfg.primary().and_then(|f| f.namespace_id.clone());
-    if let Some(id_str) = &cfg_namespace {
-        if let Ok(id) = NamespaceId::from_str(id_str) {
-            match node.docs.open(id).await {
-                Ok(Some(d)) => {
-                    tracing::info!(id = %id_str, "opened existing doc");
-                    opened = Some(d);
-                }
-                Ok(None) => tracing::warn!(id = %id_str, "doc not found locally"),
-                Err(e) => tracing::warn!(error = ?e, "docs.open failed"),
-            }
-        }
-    }
-    if opened.is_none() {
-        let cfg_ticket = cfg.primary().and_then(|f| f.doc_ticket.clone());
-        if let Some(t) = &cfg_ticket {
-            if let Ok(ticket) = DocTicket::from_str(t) {
-                match node.docs.import(ticket).await {
-                    Ok(doc) => opened = Some(doc),
-                    Err(e) => {
-                        tracing::warn!(error = ?e, "doc import failed; will recreate on demand")
-                    }
-                }
-            }
-        }
-    }
-    if let Some(d) = &opened {
-        let id_str = d.id().to_string();
-        let folder = inner.config.primary_or_default();
-        if folder.namespace_id.as_deref() != Some(id_str.as_str()) {
-            folder.namespace_id = Some(id_str);
-            if let Err(e) = config::save(&inner.config).await {
-                tracing::warn!(error = ?e, "save namespace_id failed");
-            }
-        }
-        // Re-establish sync with peers we knew before the restart, so the
-        // first connection doesn't have to wait for fresh discovery.
-        if !inner.config.known_peers.is_empty() {
-            let peers = inner.config.known_peers.clone();
-            let n = peers.len();
-            if let Err(e) = d.start_sync(peers).await {
-                tracing::warn!(error = ?e, "start_sync with known peers failed");
-            } else {
-                tracing::info!(count = n, "rejoined known peers");
-            }
-        }
-    }
-    inner.doc = opened;
-
-    drop(inner);
-
-    // If everything is in place, kick off sync.
-    if let Err(e) = maybe_start_sync(app).await {
-        tracing::warn!(error = ?e, "auto-start sync failed");
-    }
+    // Kick off sync for every folder that's ready.
+    maybe_start_all(app).await;
     Ok(())
 }
 
@@ -540,7 +557,7 @@ fn build_tray(app: AppHandle) -> Result<()> {
             "open_folder" => {
                 let app_clone = app.clone();
                 tauri::async_runtime::spawn(async move {
-                    let _ = cmd_open_folder_inner(&app_clone).await;
+                    let _ = cmd_open_folder_inner(&app_clone, 0).await;
                 });
             }
             "check_updates" => {
@@ -552,7 +569,7 @@ fn build_tray(app: AppHandle) -> Result<()> {
             "quit" => {
                 let app_clone = app.clone();
                 tauri::async_runtime::spawn(async move {
-                    shutdown(&app_clone).await;
+                    shutdown_all(&app_clone).await;
                     app_clone.exit(0);
                 });
             }
@@ -577,70 +594,104 @@ fn build_tray(app: AppHandle) -> Result<()> {
     Ok(())
 }
 
-async fn shutdown(app: &AppHandle) {
+/// Stop the sync task for one folder, if it has one running.
+async fn shutdown_folder(app: &AppHandle, idx: usize) {
     let state: State<AppState> = app.state();
-    let mut inner = state.inner.lock().await;
-    if let Some(tx) = inner.shutdown.take() {
+    let (tx, handle) = {
+        let mut inner = state.inner.lock().await;
+        match inner.folder_mut(idx) {
+            Some(rt) => (rt.shutdown.take(), rt.sync_handle.take()),
+            None => (None, None),
+        }
+    };
+    if let Some(tx) = tx {
         let _ = tx.send(true);
     }
-    if let Some(h) = inner.sync_handle.take() {
+    if let Some(h) = handle {
         let _ = h.await;
     }
 }
 
-/// Start the sync task if (a) we have a node, (b) we have a doc, (c) we
-/// have a folder, and (d) sync isn't already running.
-async fn maybe_start_sync(app: &AppHandle) -> Result<bool> {
+/// Stop every folder's sync task — used on quit.
+async fn shutdown_all(app: &AppHandle) {
+    let count = {
+        let state: State<AppState> = app.state();
+        let n = state.inner.lock().await.folders.len();
+        n
+    };
+    for idx in 0..count {
+        shutdown_folder(app, idx).await;
+    }
+}
+
+/// Start every folder's sync task that's ready and not already running.
+async fn maybe_start_all(app: &AppHandle) {
+    let count = {
+        let state: State<AppState> = app.state();
+        let n = state.inner.lock().await.folders.len();
+        n
+    };
+    for idx in 0..count {
+        if let Err(e) = maybe_start_folder(app, idx).await {
+            tracing::warn!(error = ?e, idx, "auto-start sync failed");
+        }
+    }
+}
+
+/// Start the sync task for folder `idx` if (a) we have a node, (b) the folder
+/// has a doc, (c) the folder has a local path, and (d) it isn't already running.
+async fn maybe_start_folder(app: &AppHandle, idx: usize) -> Result<bool> {
     let state: State<AppState> = app.state();
     let mut inner = state.inner.lock().await;
 
-    if inner.sync_handle.is_some() {
-        return Ok(false);
-    }
     let Some(node) = inner.node.clone() else {
-        return Ok(false);
-    };
-    let Some(doc) = inner.doc.clone() else {
         return Ok(false);
     };
     let Some(author) = inner.author else {
         return Ok(false);
     };
-    let Some(folder) = inner.config.primary().and_then(|f| f.path.clone()) else {
+    let Some(fc) = inner.config.folders.get(idx).cloned() else {
         return Ok(false);
     };
-    let Some(echo) = inner.echo.clone() else {
+    let Some(folder) = fc.path.clone() else {
         return Ok(false);
     };
-    let Some(peers) = inner.peers.clone() else {
+    let Some(rt) = inner.folders.get(idx) else {
         return Ok(false);
     };
-    let Some(names) = inner.names.clone() else {
+    if rt.sync_handle.is_some() {
+        return Ok(false);
+    }
+    let Some(doc) = rt.doc.clone() else {
         return Ok(false);
     };
-    // Make sure we have an ignore matcher loaded for the current folder.
-    if inner.ignores.is_none() {
+
+    // Make sure we have an ignore matcher loaded for this folder.
+    if inner.folders[idx].ignores.is_none() {
         match IgnoreSet::load(&folder) {
-            Ok(s) => inner.ignores = Some(Arc::new(s)),
+            Ok(s) => inner.folders[idx].ignores = Some(Arc::new(s)),
             Err(e) => return Err(anyhow::anyhow!("ignore set: {e}")),
         }
     }
-    let ignores = inner.ignores.clone().unwrap();
-    let blocked = inner.blocked.clone();
-    let active = inner.active.clone();
-    let stats = inner.stats.clone();
-    let status = inner.status.clone();
-    let log = inner.log.clone();
-    let read_only = inner.config.read_only_local;
 
+    let rt = &inner.folders[idx];
+    let ignores = rt.ignores.clone().unwrap();
+    let echo = rt.echo.clone();
+    let peers = rt.peers.clone();
+    let names = rt.names.clone();
+    let active = rt.active.clone();
+    let stats = rt.stats.clone();
+    let status = rt.status.clone();
+    let blocked = inner.blocked.clone();
+    let log = inner.log.clone();
+    let read_only = inner.config.read_only_local || fc.read_only;
     let host = inner.config.display_name();
 
     let (tx, rx) = watch::channel(false);
-    inner.shutdown = Some(tx);
 
     // Channel that sync.rs uses to publish freshly-seen peer addresses; the
     // consumer below dedupes them into the persistent config.
-    let (addr_tx, mut addr_rx) = tokio::sync::mpsc::unbounded_channel::<iroh::EndpointAddr>();
+    let (addr_tx, mut addr_rx) = mpsc::unbounded_channel::<iroh::EndpointAddr>();
 
     let st = SyncState {
         node,
@@ -666,23 +717,23 @@ async fn maybe_start_sync(app: &AppHandle) -> Result<bool> {
             tracing::error!(error = ?e, "sync task exited with error");
         }
     });
-    inner.sync_handle = Some(handle);
+    inner.folders[idx].shutdown = Some(tx);
+    inner.folders[idx].sync_handle = Some(handle);
     drop(inner);
 
-    // Spawn the persister: dedupe addr_rx into config.known_peers and save
-    // when a new one arrives. Cheap; runs only on neighbor changes.
+    // Spawn the persister: dedupe addr_rx into config.known_peers (device-
+    // global) and save when a new one arrives. Runs only on neighbor changes.
     let app_clone = app.clone();
     tauri::async_runtime::spawn(async move {
         while let Some(addr) = addr_rx.recv().await {
             let state: State<AppState> = app_clone.state();
             let mut inner = state.inner.lock().await;
-            // Replace any previous entry for this endpoint id; otherwise push.
-            let idx = inner
+            let pos = inner
                 .config
                 .known_peers
                 .iter()
                 .position(|a| a.id == addr.id);
-            match idx {
+            match pos {
                 Some(i) => inner.config.known_peers[i] = addr,
                 None => inner.config.known_peers.push(addr),
             }
@@ -697,18 +748,68 @@ async fn maybe_start_sync(app: &AppHandle) -> Result<bool> {
 
 // ---------- Tauri commands ----------
 
+/// A folder as shown in the window's folder list.
+#[derive(Debug, Serialize, Clone)]
+struct FolderView {
+    index: usize,
+    /// Absolute path, or null if joined but not yet placed on disk.
+    path: Option<String>,
+    /// Display name — the folder's basename, or a placeholder.
+    name: String,
+    has_doc: bool,
+    syncing: bool,
+    online_peers: usize,
+}
+
+/// The folder's basename for display, or a placeholder when it has no path.
+fn folder_display_name(path: Option<&PathBuf>) -> String {
+    match path {
+        Some(p) => p
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| p.display().to_string()),
+        None => "New folder".to_string(),
+    }
+}
+
 #[tauri::command]
-async fn cmd_get_status(state: State<'_, AppState>) -> Result<StatusView, String> {
+async fn cmd_list_folders(state: State<'_, AppState>) -> Result<Vec<FolderView>, String> {
     let inner = state.inner.lock().await;
-    let peers_online = match &inner.peers {
-        Some(map) => map.lock().await.values().filter(|p| p.online).count(),
+    let mut out = Vec::with_capacity(inner.config.folders.len());
+    for (i, fc) in inner.config.folders.iter().enumerate() {
+        let rt = inner.folders.get(i);
+        let online_peers = match rt {
+            Some(rt) => rt.peers.lock().await.values().filter(|p| p.online).count(),
+            None => 0,
+        };
+        out.push(FolderView {
+            index: i,
+            path: fc.path.as_ref().map(|p| p.display().to_string()),
+            name: folder_display_name(fc.path.as_ref()),
+            has_doc: rt.map(|r| r.doc.is_some()).unwrap_or(false),
+            syncing: rt.map(|r| r.sync_handle.is_some()).unwrap_or(false),
+            online_peers,
+        });
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+async fn cmd_get_status(state: State<'_, AppState>, idx: usize) -> Result<StatusView, String> {
+    let inner = state.inner.lock().await;
+    let self_id = inner.node.as_ref().map(|n| n.endpoint.id().to_string());
+    let fc = inner.config.folders.get(idx);
+    let rt = inner.folders.get(idx);
+
+    let peers_online = match rt {
+        Some(rt) => rt.peers.lock().await.values().filter(|p| p.online).count(),
         None => 0,
     };
-    // Known = the doc roster (every device that published a name), minus this
-    // one — the whole swarm, not just devices with a live link here.
-    let self_id = inner.node.as_ref().map(|n| n.endpoint.id().to_string());
-    let peers_known = match &inner.names {
-        Some(n) => n
+    // Known = the doc roster (every device that published a name) minus this
+    // one — the whole swarm for this folder, not just our live links.
+    let peers_known = match rt {
+        Some(rt) => rt
+            .names
             .lock()
             .await
             .keys()
@@ -716,21 +817,24 @@ async fn cmd_get_status(state: State<'_, AppState>) -> Result<StatusView, String
             .count(),
         None => 0,
     };
-    let message = inner.status.lock().await.clone();
-    let owner_id = match &inner.doc {
+    let message = match rt {
+        Some(rt) => rt.status.lock().await.clone(),
+        None => String::new(),
+    };
+    let owner_id = match rt.and_then(|r| r.doc.as_ref()) {
         Some(doc) => sync::owner_id(doc).await.ok().flatten(),
         None => None,
     };
     let is_owner = matches!((&owner_id, &self_id), (Some(o), Some(me)) if o == me);
-    let primary = inner.config.primary();
-    let folder_path = primary.and_then(|f| f.path.as_ref());
+    let folder_path = fc.and_then(|f| f.path.as_ref());
+    let has_doc = rt.map(|r| r.doc.is_some()).unwrap_or(false);
     Ok(StatusView {
         folder: folder_path.map(|p| p.display().to_string()),
         hostname: inner.config.hostname.clone(),
-        has_doc: inner.doc.is_some(),
-        has_ticket: primary.and_then(|f| f.doc_ticket.as_ref()).is_some(),
-        paired: inner.doc.is_some() && folder_path.is_some(),
-        syncing: inner.sync_handle.is_some(),
+        has_doc,
+        has_ticket: fc.and_then(|f| f.doc_ticket.as_ref()).is_some(),
+        paired: has_doc && folder_path.is_some(),
+        syncing: rt.map(|r| r.sync_handle.is_some()).unwrap_or(false),
         peers_online,
         peers_known,
         message,
@@ -752,31 +856,28 @@ async fn cmd_get_log(state: State<'_, AppState>) -> Result<Vec<String>, String> 
 }
 
 #[tauri::command]
-async fn cmd_get_peers(state: State<'_, AppState>) -> Result<Vec<PeerView>, String> {
+async fn cmd_get_peers(state: State<'_, AppState>, idx: usize) -> Result<Vec<PeerView>, String> {
     let inner = state.inner.lock().await;
     let self_id = inner.node.as_ref().map(|n| n.endpoint.id().to_string());
-    let peers = inner.peers.clone();
-    let names = inner.names.clone();
+    let Some(rt) = inner.folders.get(idx) else {
+        return Ok(Vec::new());
+    };
+    let peers = rt.peers.clone();
+    let names = rt.names.clone();
     let blocked = inner.blocked.clone();
     let persisted = inner.config.peer_last_seen.clone();
     drop(inner);
 
-    let name_map = match names {
-        Some(n) => n.lock().await.clone(),
-        None => HashMap::new(),
-    };
-    let peer_map = match peers {
-        Some(p) => p.lock().await.clone(),
-        None => HashMap::new(),
-    };
+    let name_map = names.lock().await.clone();
+    let peer_map = peers.lock().await.clone();
     // Devices we've stopped syncing with are hidden entirely — they reappear
     // only if the user pairs again, which clears the block.
     let blocked_set = blocked.lock().await.clone();
 
-    // The list is the whole swarm, not just our live links. Every device that
-    // published a name into the doc (`name_map`) is a member, plus anything
-    // we have a connection to. A member with no direct link here is shown
-    // offline — sync still reaches it transitively through other peers.
+    // The list is the whole swarm for this folder, not just our live links.
+    // Every device that published a name into the doc is a member, plus
+    // anything we have a connection to. A member with no direct link here is
+    // shown offline — sync still reaches it transitively through other peers.
     let mut ids: HashSet<String> = name_map.keys().cloned().collect();
     ids.extend(peer_map.keys().cloned());
 
@@ -809,31 +910,35 @@ async fn cmd_get_peers(state: State<'_, AppState>) -> Result<Vec<PeerView>, Stri
 async fn cmd_get_ticket(
     app: AppHandle,
     state: State<'_, AppState>,
+    idx: usize,
     read_only: Option<bool>,
 ) -> Result<String, String> {
     let s = {
         let mut inner = state.inner.lock().await;
         let node = inner.node.clone().ok_or("node not ready")?;
+        let author = inner.author;
+        if inner.config.folders.get(idx).is_none() || inner.folders.get(idx).is_none() {
+            return Err("no such folder".into());
+        }
 
         // Create the doc on demand.
-        if inner.doc.is_none() {
+        if inner.folders[idx].doc.is_none() {
             let doc = node.docs.create().await.map_err(|e| e.to_string())?;
             // First to create the doc — this device is the folder's owner.
-            if let Some(author) = inner.author {
+            if let Some(author) = author {
                 if let Err(e) = sync::publish_owner(&doc, author, &node).await {
                     tracing::warn!(error = ?e, "publish owner failed");
                 }
             }
-            inner.doc = Some(doc);
+            inner.folders[idx].doc = Some(doc);
         }
-        let doc = inner.doc.clone().unwrap();
+        let doc = inner.folders[idx].doc.clone().unwrap();
         let (mode, opts) = peer::share_opts(read_only.unwrap_or(false));
         let ticket = doc.share(mode, opts).await.map_err(|e| e.to_string())?;
         let s = ticket.to_string();
 
-        let folder = inner.config.primary_or_default();
-        folder.doc_ticket = Some(s.clone());
-        folder.namespace_id = Some(doc.id().to_string());
+        inner.config.folders[idx].doc_ticket = Some(s.clone());
+        inner.config.folders[idx].namespace_id = Some(doc.id().to_string());
         // Pairing re-authorizes: clear the stop-syncing list so a device
         // stopped earlier can sync again.
         inner.config.blocked_peers.clear();
@@ -845,7 +950,7 @@ async fn cmd_get_ticket(
     };
 
     // Creating the doc just now may have unblocked sync (folder already set).
-    let _ = maybe_start_sync(&app).await;
+    let _ = maybe_start_folder(&app, idx).await;
     Ok(s)
 }
 
@@ -854,10 +959,10 @@ async fn cmd_join_with_ticket(
     app: AppHandle,
     state: State<'_, AppState>,
     ticket: String,
-) -> Result<(), String> {
+) -> Result<usize, String> {
     let parsed = DocTicket::from_str(ticket.trim())
         .map_err(|e| format!("that doesn't look like a valid ticket: {e}"))?;
-    {
+    let idx = {
         let mut inner = state.inner.lock().await;
         let node = inner.node.clone().ok_or("node not ready")?;
         let doc = match node.docs.import(parsed).await {
@@ -867,10 +972,34 @@ async fn cmd_join_with_ticket(
                 return Err(format!("could not join: {e}"));
             }
         };
-        let folder = inner.config.primary_or_default();
-        folder.namespace_id = Some(doc.id().to_string());
-        folder.doc_ticket = Some(ticket.trim().to_string());
-        inner.doc = Some(doc);
+        let namespace = doc.id().to_string();
+
+        // Already syncing this namespace? Re-use that folder; else add one.
+        let existing = inner
+            .config
+            .folders
+            .iter()
+            .position(|f| f.namespace_id.as_deref() == Some(namespace.as_str()));
+        let idx = match existing {
+            Some(i) => {
+                inner.config.folders[i].doc_ticket = Some(ticket.trim().to_string());
+                inner.folders[i].doc = Some(doc);
+                i
+            }
+            None => {
+                inner.config.folders.push(config::FolderConfig {
+                    path: None,
+                    doc_ticket: Some(ticket.trim().to_string()),
+                    namespace_id: Some(namespace),
+                    read_only: false,
+                });
+                inner.folders.push(FolderRuntime {
+                    doc: Some(doc),
+                    ..Default::default()
+                });
+                inner.config.folders.len() - 1
+            }
+        };
         // Pairing re-authorizes: clear the stop-syncing list so a device
         // stopped earlier can sync again.
         inner.config.blocked_peers.clear();
@@ -878,34 +1007,26 @@ async fn cmd_join_with_ticket(
         config::save(&inner.config)
             .await
             .map_err(|e| e.to_string())?;
-        sync::log_line(&inner.log, "paired: joined shared folder, connecting…").await;
-    }
-    // Joining swaps in a different doc. If a sync task was already running —
-    // from an earlier pairing, or because this device created its own doc
-    // first — it is still bound to the old namespace and will never see the
-    // peer we just joined. Stop it so the start below binds to the new doc.
-    shutdown(&app).await;
-    let started = maybe_start_sync(&app).await.unwrap_or(false);
-    if !started {
-        // Doc is set but sync didn't start — almost always "no folder yet".
-        let inner = state.inner.lock().await;
-        if inner
-            .config
-            .primary()
-            .and_then(|f| f.path.as_ref())
-            .is_none()
-        {
-            return Err("joined — now choose a folder to sync".into());
-        }
-    }
-    Ok(())
+        sync::log_line(&inner.log, "paired: joined shared folder").await;
+        idx
+    };
+    // Re-bind sync to the (possibly new) doc. For a brand-new folder the
+    // restart is a no-op and the start does nothing until a path is picked;
+    // the GUI then prompts for a location.
+    shutdown_folder(&app, idx).await;
+    let _ = maybe_start_folder(&app, idx).await;
+    Ok(idx)
 }
 
+/// Pick a local folder. `idx = Some(i)` sets the path of folder `i` (used
+/// after joining, when the folder has no local location yet); `idx = None`
+/// adds a brand-new folder. Returns the folder's index, or null if cancelled.
 #[tauri::command]
-async fn cmd_choose_folder(
+async fn cmd_pick_folder(
     app: AppHandle,
     state: State<'_, AppState>,
-) -> Result<Option<String>, String> {
+    idx: Option<usize>,
+) -> Result<Option<usize>, String> {
     let chosen = app
         .dialog()
         .file()
@@ -917,34 +1038,81 @@ async fn cmd_choose_folder(
     let pb: PathBuf = path
         .into_path()
         .map_err(|e| format!("path conversion failed: {e}"))?;
-    {
+    let ignores = IgnoreSet::load(&pb).ok().map(Arc::new);
+
+    let target = {
         let mut inner = state.inner.lock().await;
-        inner.config.primary_or_default().path = Some(pb.clone());
-        // Reload .syncboxignore for the new folder.
-        match IgnoreSet::load(&pb) {
-            Ok(s) => inner.ignores = Some(Arc::new(s)),
-            Err(e) => tracing::warn!(error = ?e, "could not load ignore set"),
-        }
+        let target = match idx {
+            Some(i) if i < inner.config.folders.len() => {
+                inner.config.folders[i].path = Some(pb.clone());
+                if let Some(rt) = inner.folders.get_mut(i) {
+                    rt.ignores = ignores;
+                }
+                i
+            }
+            _ => {
+                inner
+                    .config
+                    .folders
+                    .push(config::FolderConfig::for_path(pb.clone()));
+                inner.folders.push(FolderRuntime {
+                    ignores,
+                    ..Default::default()
+                });
+                inner.config.folders.len() - 1
+            }
+        };
         config::save(&inner.config)
             .await
             .map_err(|e| e.to_string())?;
+        target
+    };
+    let _ = maybe_start_folder(&app, target).await;
+    Ok(Some(target))
+}
+
+/// Stop syncing a folder and drop it from the config. Local files are left.
+#[tauri::command]
+async fn cmd_remove_folder(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    idx: usize,
+) -> Result<(), String> {
+    shutdown_folder(&app, idx).await;
+    let mut inner = state.inner.lock().await;
+    if idx >= inner.config.folders.len() {
+        return Err("no such folder".into());
     }
-    let _ = maybe_start_sync(&app).await;
-    Ok(Some(pb.display().to_string()))
+    inner.config.folders.remove(idx);
+    if idx < inner.folders.len() {
+        inner.folders.remove(idx);
+    }
+    config::save(&inner.config)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
-async fn cmd_open_folder(app: AppHandle, _state: State<'_, AppState>) -> Result<(), String> {
-    cmd_open_folder_inner(&app).await.map_err(|e| e.to_string())
+async fn cmd_open_folder(
+    app: AppHandle,
+    _state: State<'_, AppState>,
+    idx: usize,
+) -> Result<(), String> {
+    cmd_open_folder_inner(&app, idx)
+        .await
+        .map_err(|e| e.to_string())
 }
 
-async fn cmd_open_folder_inner(app: &AppHandle) -> Result<()> {
+async fn cmd_open_folder_inner(app: &AppHandle, idx: usize) -> Result<()> {
     let state: State<AppState> = app.state();
-    let inner = state.inner.lock().await;
-    let Some(path) = inner.config.primary().and_then(|f| f.path.clone()) else {
+    let path = {
+        let inner = state.inner.lock().await;
+        inner.config.folders.get(idx).and_then(|f| f.path.clone())
+    };
+    let Some(path) = path else {
         return Ok(());
     };
-    drop(inner);
     if let Err(e) = tauri_plugin_opener::reveal_item_in_dir(&path) {
         tracing::warn!(error = ?e, "reveal_item_in_dir failed; trying open_path");
         tauri_plugin_opener::open_path(path.display().to_string(), None::<&str>)?;
@@ -968,8 +1136,10 @@ fn cmd_get_autostart(app: AppHandle) -> Result<bool, String> {
 }
 
 #[tauri::command]
-async fn cmd_start_sync(app: AppHandle) -> Result<bool, String> {
-    maybe_start_sync(&app).await.map_err(|e| e.to_string())
+async fn cmd_start_sync(app: AppHandle, idx: usize) -> Result<bool, String> {
+    maybe_start_folder(&app, idx)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 // ---------- Short-code pairing (rendezvous server) ----------
@@ -1008,29 +1178,33 @@ async fn cmd_set_pair_server(state: State<'_, AppState>, url: String) -> Result<
 async fn cmd_make_code(
     app: AppHandle,
     state: State<'_, AppState>,
+    idx: usize,
     read_only: Option<bool>,
 ) -> Result<PairCodeView, String> {
-    // First, make sure we have a doc + ticket, exactly as cmd_get_ticket does.
+    // First, make sure the folder has a doc + ticket, as cmd_get_ticket does.
     let (server, ticket_str) = {
         let mut inner = state.inner.lock().await;
         let node = inner.node.clone().ok_or("node not ready")?;
-        if inner.doc.is_none() {
+        let author = inner.author;
+        if inner.config.folders.get(idx).is_none() || inner.folders.get(idx).is_none() {
+            return Err("no such folder".into());
+        }
+        if inner.folders[idx].doc.is_none() {
             let doc = node.docs.create().await.map_err(|e| e.to_string())?;
             // First to create the doc — this device is the folder's owner.
-            if let Some(author) = inner.author {
+            if let Some(author) = author {
                 if let Err(e) = sync::publish_owner(&doc, author, &node).await {
                     tracing::warn!(error = ?e, "publish owner failed");
                 }
             }
-            inner.doc = Some(doc);
+            inner.folders[idx].doc = Some(doc);
         }
-        let doc = inner.doc.clone().unwrap();
+        let doc = inner.folders[idx].doc.clone().unwrap();
         let (mode, opts) = peer::share_opts(read_only.unwrap_or(false));
         let ticket = doc.share(mode, opts).await.map_err(|e| e.to_string())?;
         let s = ticket.to_string();
-        let folder = inner.config.primary_or_default();
-        folder.namespace_id = Some(doc.id().to_string());
-        folder.doc_ticket = Some(s.clone());
+        inner.config.folders[idx].namespace_id = Some(doc.id().to_string());
+        inner.config.folders[idx].doc_ticket = Some(s.clone());
         // Pairing re-authorizes: clear the stop-syncing list so a device
         // stopped earlier can sync again.
         inner.config.blocked_peers.clear();
@@ -1041,9 +1215,9 @@ async fn cmd_make_code(
         (pair_server_url(&inner.config), s)
     };
 
-    // The doc now exists — if a folder was already chosen, this starts the
-    // sync task. Without it, the code-issuing device never publishes files.
-    let _ = maybe_start_sync(&app).await;
+    // The doc now exists — if a folder path was already chosen, this starts
+    // the sync task. Without it, the code-issuing device publishes no files.
+    let _ = maybe_start_folder(&app, idx).await;
 
     let pc = pair::create_code(&server, &ticket_str)
         .await
@@ -1059,7 +1233,7 @@ async fn cmd_use_code(
     app: AppHandle,
     state: State<'_, AppState>,
     code: String,
-) -> Result<(), String> {
+) -> Result<usize, String> {
     let server = {
         let inner = state.inner.lock().await;
         pair_server_url(&inner.config)
@@ -1074,14 +1248,17 @@ async fn cmd_use_code(
 
 #[tauri::command]
 async fn cmd_get_storage_size(_state: State<'_, AppState>) -> Result<u64, String> {
-    // Size of the synced folder — the content the user actually keeps. Not the
-    // iroh blob store: that holds a second, content-addressed copy of every
-    // blob and would over-report (badly so before GC reclaims orphaned blobs).
+    // Total size of every synced folder — the content the user actually keeps.
+    // Not the iroh blob store: that holds a second, content-addressed copy of
+    // every blob and would over-report (badly so before GC reclaims orphans).
     let cfg = config::load().await.map_err(|e| e.to_string())?;
-    match cfg.primary().and_then(|f| f.path.as_ref()) {
-        Some(folder) => Ok(dir_size(folder)),
-        None => Ok(0),
+    let mut total = 0u64;
+    for f in &cfg.folders {
+        if let Some(path) = &f.path {
+            total = total.saturating_add(dir_size(path));
+        }
     }
+    Ok(total)
 }
 
 fn dir_size(path: &std::path::Path) -> u64 {
@@ -1197,14 +1374,16 @@ async fn cmd_set_device_name(state: State<'_, AppState>, name: String) -> Result
         .map_err(|e| e.to_string())?;
     let display = inner.config.display_name();
 
-    if let (Some(doc), Some(author), Some(node), Some(names)) = (
-        inner.doc.clone(),
-        inner.author,
-        inner.node.clone(),
-        inner.names.clone(),
-    ) {
-        if let Err(e) = sync::publish_name(&doc, author, &node, &names, &display).await {
-            tracing::warn!(error = ?e, "re-publish device name failed");
+    // Re-publish the name into every folder's doc so paired devices on each
+    // shared folder pick it up without a restart.
+    if let (Some(author), Some(node)) = (inner.author, inner.node.clone()) {
+        for rt in &inner.folders {
+            if let Some(doc) = rt.doc.clone() {
+                let names = rt.names.clone();
+                if let Err(e) = sync::publish_name(&doc, author, &node, &names, &display).await {
+                    tracing::warn!(error = ?e, "re-publish device name failed");
+                }
+            }
         }
     }
     Ok(display)
@@ -1226,8 +1405,8 @@ async fn cmd_set_read_only(
             .await
             .map_err(|e| e.to_string())?;
     }
-    // Restart sync so the new value takes effect.
-    restart_sync(&app).await.map_err(|e| e.to_string())?;
+    // Restart every folder's sync so the new value takes effect.
+    restart_all(&app).await;
     Ok(())
 }
 
@@ -1237,12 +1416,12 @@ async fn cmd_get_read_only(state: State<'_, AppState>) -> Result<bool, String> {
     Ok(inner.config.read_only_local)
 }
 
-/// Write a sane default `.syncboxignore` into the synced folder if none exists.
+/// Write a sane default `.syncboxignore` into a synced folder if none exists.
 #[tauri::command]
-async fn cmd_write_default_ignore(state: State<'_, AppState>) -> Result<bool, String> {
+async fn cmd_write_default_ignore(state: State<'_, AppState>, idx: usize) -> Result<bool, String> {
     let folder = {
         let inner = state.inner.lock().await;
-        inner.config.primary().and_then(|f| f.path.clone())
+        inner.config.folders.get(idx).and_then(|f| f.path.clone())
     };
     let Some(folder) = folder else {
         return Err("no folder set".into());
@@ -1263,16 +1442,22 @@ async fn cmd_write_default_ignore(state: State<'_, AppState>) -> Result<bool, St
     Ok(true)
 }
 
-async fn restart_sync(app: &AppHandle) -> Result<()> {
-    shutdown(app).await;
-    let _ = maybe_start_sync(app).await?;
-    Ok(())
+/// Stop and restart sync for every folder.
+async fn restart_all(app: &AppHandle) {
+    shutdown_all(app).await;
+    maybe_start_all(app).await;
 }
 
 #[tauri::command]
-async fn cmd_get_transfer_stats(state: State<'_, AppState>) -> Result<sync::TransferStats, String> {
+async fn cmd_get_transfer_stats(
+    state: State<'_, AppState>,
+    idx: usize,
+) -> Result<sync::TransferStats, String> {
     let inner = state.inner.lock().await;
-    let mut s = inner.stats.lock().await.clone();
+    let Some(rt) = inner.folders.get(idx) else {
+        return Ok(sync::TransferStats::default());
+    };
+    let mut s = rt.stats.lock().await.clone();
     // Decay a stale rate: if nothing landed in the last ~3s, call it idle.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

@@ -136,6 +136,24 @@ h2 {
   font-weight: 600;
 }
 
+/* The folder switcher replaces the plain name once two+ folders exist. */
+.folder-switch {
+  max-width: 100%;
+  font: inherit;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text);
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  padding: 2px 6px;
+  cursor: pointer;
+}
+
+.folder-switch:hover {
+  background: var(--line);
+}
+
 .run-status {
   display: flex;
   align-items: center;

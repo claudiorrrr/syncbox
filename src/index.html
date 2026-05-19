@@ -19,52 +19,26 @@
         <button id="btn-settings" class="icon-btn invisible" title="Settings" aria-label="Settings">⚙</button>
       </header>
 
-      <!-- ===== SETUP — step 1: choose a folder ===== -->
+      <!-- ===== ADD A FOLDER — also the first-run setup ===== -->
       <section id="view-folder" class="view" hidden>
-        <p class="step">Step 1 of 2</p>
-        <h2>Pick a folder to sync</h2>
-        <p class="muted">
-          Everything inside this folder syncs to your other Macs.
-        </p>
-        <button id="btn-choose-folder">Choose folder…</button>
-      </section>
+        <p class="step" id="folder-step" hidden>Step 1 of 2</p>
+        <h2 id="folder-title">Sync a folder</h2>
 
-      <!-- ===== ADD A DEVICE ===== -->
-      <section id="view-adddevice" class="view" hidden>
-        <p class="step" id="adddevice-step" hidden>Step 2 of 2</p>
-        <h2>Add a device</h2>
-
-        <div id="adddevice-choice">
-          <p class="muted">Connect another Mac to sync this folder with.</p>
-          <button id="btn-show-code" class="choice">
-            <strong>Show a code</strong>
-            <span class="muted small">On this Mac — type it into the other one</span>
+        <div id="folder-choice">
+          <p class="muted">Keep a folder in sync across your Macs.</p>
+          <button id="btn-choose-folder" class="choice">
+            <strong>Choose a folder on this Mac</strong>
+            <span class="muted small">Start sharing a folder you already have</span>
           </button>
-          <button id="btn-enter-code" class="choice">
+          <button id="btn-folder-enter-code" class="choice">
             <strong>Enter a code</strong>
-            <span class="muted small">You already have a code from another Mac</span>
+            <span class="muted small">Join a folder shared from another Mac</span>
           </button>
         </div>
 
-        <div id="panel-show-code" hidden>
-          <button class="link adddevice-back">‹ Back</button>
-          <p class="muted">Type this code into the other Mac within 5 minutes.</p>
-          <div class="code-display">
-            <span id="our-code" class="code">— — —</span>
-            <span id="code-expiry" class="muted small"></span>
-          </div>
-          <div class="row">
-            <button id="btn-make-code">Get code</button>
-            <button id="btn-copy-code">Copy</button>
-          </div>
-          <label class="checkbox">
-            <input type="checkbox" id="ticket-read-only" />
-            <span>Read-only — the other Mac receives changes but can't send any back</span>
-          </label>
-        </div>
-
-        <div id="panel-enter-code" hidden>
-          <button class="link adddevice-back">‹ Back</button>
+        <div id="folder-enter-panel" hidden>
+          <button class="link folder-back">‹ Back</button>
+          <p class="muted">Type the code shown on the other Mac.</p>
           <label class="block">
             <span>Code from the other Mac</span>
             <input id="join-code" type="text" maxlength="7" placeholder="ABC-123" autocapitalize="characters" />
@@ -79,6 +53,7 @@
         <div class="folder-head">
           <span class="folder-head-icon" aria-hidden="true">📁</span>
           <span id="run-folder" class="folder-head-name">folder</span>
+          <select id="folder-switch" class="folder-switch" hidden aria-label="Switch folder"></select>
           <div class="run-status">
             <span id="status-icon" class="run-icon ok" aria-hidden="true">✓</span>
             <span id="status-line">Up to date</span>
@@ -96,6 +71,28 @@
         <button id="btn-add-device" class="link">+ Add a device</button>
       </section>
 
+      <!-- ===== ADD A DEVICE — share the current folder ===== -->
+      <section id="view-adddevice" class="view" hidden>
+        <p class="step" id="adddevice-step" hidden>Step 2 of 2</p>
+        <h2>Add a device</h2>
+        <p class="muted">
+          Connect another Mac to <strong id="adddevice-folder">this folder</strong>.
+          Type this code into it within 5 minutes.
+        </p>
+        <div class="code-display">
+          <span id="our-code" class="code">— — —</span>
+          <span id="code-expiry" class="muted small"></span>
+        </div>
+        <div class="row">
+          <button id="btn-make-code">Get code</button>
+          <button id="btn-copy-code">Copy</button>
+        </div>
+        <label class="checkbox">
+          <input type="checkbox" id="ticket-read-only" />
+          <span>Read-only — the other Mac receives changes but can't send any back</span>
+        </label>
+      </section>
+
       <!-- ===== SETTINGS ===== -->
       <section id="view-settings" class="view" hidden>
         <h2>Settings</h2>
@@ -106,12 +103,9 @@
         </label>
 
         <div class="setting">
-          <span class="setting-label">Synced folder</span>
-          <code id="folder-path" class="path">(not set)</code>
-          <div class="row">
-            <button id="btn-choose-folder-2">Change folder…</button>
-            <button id="btn-open-folder" class="link" hidden>Reveal in Finder</button>
-          </div>
+          <span class="setting-label">Synced folders</span>
+          <ul id="folder-list" class="devices"></ul>
+          <button id="btn-add-folder" class="link">+ Sync another folder</button>
         </div>
 
         <label class="checkbox">
@@ -127,12 +121,13 @@
           <span>Make this device read-only — changes made here won't sync out</span>
         </label>
 
-        <button id="btn-write-ignore" class="link">Create .syncboxignore in folder</button>
+        <button id="btn-write-ignore" class="link">Create .syncboxignore in the current folder</button>
 
         <p class="muted small" id="storage-line">Storage: —</p>
 
         <details class="advanced">
           <summary>Advanced</summary>
+          <p class="muted small">Raw tickets for the current folder.</p>
           <label class="block">
             <span>This device's ticket</span>
             <textarea id="our-ticket" readonly placeholder="Click Show ticket"></textarea>
@@ -142,7 +137,7 @@
             <button id="btn-copy-ticket">Copy</button>
           </div>
           <label class="block">
-            <span>Join with a raw ticket</span>
+            <span>Join a folder with a raw ticket</span>
             <textarea id="join-ticket" placeholder="Paste a ticket here"></textarea>
           </label>
           <button id="btn-join">Join</button>
