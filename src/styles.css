@@ -7,6 +7,8 @@
   --muted: #6c6c70;
   --accent: #007aff;
   --danger: #ff3b30;
+  --ok: #34c759;
+  --warn: #ff9500;
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui,
     sans-serif;
 }
@@ -25,6 +27,10 @@
   box-sizing: border-box;
 }
 
+[hidden] {
+  display: none !important;
+}
+
 html,
 body {
   margin: 0;
@@ -38,53 +44,200 @@ body {
 main {
   max-width: 480px;
   margin: 0 auto;
-  padding: 18px;
+  padding: 16px 18px 22px;
   display: flex;
   flex-direction: column;
   gap: 14px;
 }
 
+/* ---------- header ---------- */
+
 header {
   display: flex;
-  justify-content: space-between;
-  align-items: baseline;
+  align-items: center;
+  gap: 6px;
 }
 
 h1 {
-  font-size: 20px;
+  flex: 1;
+  text-align: center;
+  font-size: 18px;
   margin: 0;
 }
 
 h2 {
   font-size: 14px;
-  margin: 0 0 6px;
+  margin: 0;
 }
 
-.card {
-  background: var(--card);
-  border-radius: 10px;
-  padding: 14px 16px;
-  box-shadow: 0 1px 0 var(--line) inset, 0 1px 2px #0000000a;
-}
-
-.row {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-  margin-top: 8px;
-}
-
-.block {
-  display: block;
-  margin: 10px 0;
-}
-
-.block > span {
-  display: block;
+.icon-btn {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
   color: var(--muted);
-  font-size: 11px;
-  margin-bottom: 4px;
+  font-size: 17px;
+  cursor: pointer;
 }
+
+.icon-btn:hover {
+  background: var(--line);
+  color: var(--text);
+}
+
+.invisible {
+  visibility: hidden;
+}
+
+/* ---------- views ---------- */
+
+.view {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.view p {
+  margin: 0;
+}
+
+.step {
+  margin: 0;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+}
+
+/* ---------- running: folder + devices ---------- */
+
+.folder-head {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 0 2px;
+}
+
+.folder-head-icon {
+  font-size: 38px;
+  line-height: 1;
+}
+
+.folder-head-name {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.run-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.run-icon.ok {
+  color: var(--ok);
+}
+
+.run-icon.warn {
+  color: var(--warn);
+}
+
+.run-icon.sync {
+  color: var(--accent);
+}
+
+.run-sub {
+  margin: 0;
+  text-align: center;
+}
+
+.devices {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.device {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 6px;
+  border-radius: 6px;
+  font-size: 12px;
+}
+
+.device:hover {
+  background: var(--line);
+}
+
+/* Removal control: hidden until the row is hovered, so it's deliberate. */
+.device .dremove {
+  flex-shrink: 0;
+  opacity: 0;
+  color: var(--danger);
+}
+
+.device:hover .dremove,
+.device .dremove:focus-visible {
+  opacity: 1;
+}
+
+.device .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex-shrink: 0;
+}
+
+.device.online .dot {
+  background: var(--ok);
+}
+
+.device.stale {
+  opacity: 0.5;
+}
+
+.device.stale .dot {
+  background: transparent;
+  border: 1px solid var(--muted);
+}
+
+.device .dname {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.device .dwhen {
+  flex-shrink: 0;
+}
+
+.owner-badge {
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border-radius: 999px;
+  padding: 1px 7px;
+}
+
+/* ---------- buttons ---------- */
 
 button {
   appearance: none;
@@ -97,21 +250,101 @@ button {
   cursor: pointer;
 }
 
-button.link {
-  background: transparent;
-  color: var(--accent);
-  padding: 0;
-  margin-top: 6px;
-}
-
 button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }
 
+button.link {
+  align-self: flex-start;
+  background: transparent;
+  color: var(--accent);
+  padding: 0;
+}
+
+button.link.tiny {
+  font-size: 11px;
+}
+
+/* big two-line pick-one buttons in the add-device view */
+.choice {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  width: 100%;
+  text-align: left;
+  background: var(--card);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 12px 14px;
+}
+
+.choice strong {
+  font-size: 14px;
+}
+
+.choice:hover {
+  border-color: var(--accent);
+}
+
+.row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+/* ---------- form fields ---------- */
+
+.block {
+  display: block;
+}
+
+.block > span,
+.setting-label {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+  margin-bottom: 4px;
+}
+
+.checkbox {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.checkbox input {
+  margin-top: 2px;
+}
+
+.plain-input {
+  width: 100%;
+  font: inherit;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+
+#join-code {
+  width: 100%;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 16px;
+  text-transform: uppercase;
+  letter-spacing: 2px;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 8px;
+}
+
 textarea {
   width: 100%;
-  min-height: 60px;
+  min-height: 56px;
   resize: vertical;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 11px;
@@ -122,23 +355,22 @@ textarea {
   padding: 6px 8px;
 }
 
-code,
 .path {
+  display: block;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 11px;
   background: var(--bg);
-  padding: 3px 6px;
-  border-radius: 4px;
-  word-break: break-all;
-  flex: 1;
-  color: var(--text);
   border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 4px 6px;
+  word-break: break-all;
+  color: var(--text);
 }
 
 hr {
   border: 0;
   border-top: 1px solid var(--line);
-  margin: 12px 0;
+  margin: 4px 0;
 }
 
 .muted {
@@ -149,59 +381,11 @@ hr {
   font-size: 11px;
 }
 
-.checkbox {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 8px;
+.version {
+  margin-top: 6px;
 }
 
-footer {
-  padding: 0 2px 12px;
-}
-
-.peers {
-  list-style: none;
-  padding: 0;
-  margin: 6px 0 0;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.peers li {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11px;
-  color: var(--muted);
-}
-
-.peers li .dot {
-  display: inline-block;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--muted);
-  flex-shrink: 0;
-}
-
-.peers li.online .dot {
-  background: #34c759;
-}
-
-.peers li .pid {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  flex: 1;
-}
-
-button.link.tiny {
-  font-size: 10px;
-  padding: 0 4px;
-}
+/* ---------- pairing code ---------- */
 
 .code-display {
   display: flex;
@@ -212,7 +396,6 @@ button.link.tiny {
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: 14px 18px;
-  margin: 8px 0;
 }
 
 .code {
@@ -222,65 +405,21 @@ button.link.tiny {
   font-weight: 600;
 }
 
-input[type="text"] {
-  width: 100%;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 14px;
-  border: 1px solid var(--line);
-  background: var(--bg);
-  color: var(--text);
-  border-radius: 6px;
-  padding: 6px 8px;
-  text-transform: uppercase;
-  letter-spacing: 2px;
-}
-
-#pair-server {
-  text-transform: none;
-  letter-spacing: 0;
-  font-size: 11px;
-}
-
-/* The device name in the header: reads as muted subtitle text, reveals an
-   editable field on hover/focus. */
-.device-name {
-  width: auto;
-  max-width: 190px;
-  font-family: inherit;
+.pair-result {
+  margin: 0;
   font-size: 12px;
-  text-transform: none;
-  letter-spacing: 0;
-  text-align: right;
-  border: 1px solid transparent;
-  background: transparent;
-  color: var(--muted);
-  padding: 2px 6px;
+  min-height: 1em;
 }
 
-.device-name:hover {
-  border-color: var(--line);
+.pair-result.ok {
+  color: var(--ok);
 }
 
-.device-name:focus {
-  border-color: var(--accent);
-  color: var(--text);
-  background: var(--bg);
-  outline: none;
+.pair-result.err {
+  color: var(--danger);
 }
 
-details.advanced {
-  margin-top: 12px;
-  padding-top: 8px;
-  border-top: 1px dashed var(--line);
-}
-
-details.advanced summary {
-  cursor: pointer;
-  color: var(--muted);
-  font-size: 11px;
-  margin-bottom: 6px;
-  user-select: none;
-}
+/* ---------- disclosures ---------- */
 
 details summary {
   cursor: pointer;
@@ -289,22 +428,16 @@ details summary {
   user-select: none;
 }
 
-.pair-result {
-  margin: 8px 0 0;
-  font-size: 12px;
-  min-height: 1em;
+details.advanced {
+  padding-top: 6px;
+  border-top: 1px dashed var(--line);
 }
 
-.pair-result.ok {
-  color: #34c759;
-}
-
-.pair-result.err {
-  color: var(--danger);
+details > *:not(summary) {
+  margin-top: 8px;
 }
 
 .debug-log {
-  margin: 8px 0 4px;
   max-height: 180px;
   overflow-y: auto;
   background: var(--bg);
@@ -317,4 +450,27 @@ details summary {
   white-space: pre-wrap;
   word-break: break-all;
   color: var(--text);
+}
+
+/* ---------- update banner ---------- */
+
+.update-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 13px;
+}
+
+.update-banner span {
+  flex: 1;
+}
+
+.update-banner button {
+  background: #fff;
+  color: var(--accent);
+  white-space: nowrap;
 }

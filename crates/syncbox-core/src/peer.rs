@@ -1,12 +1,26 @@
 use anyhow::{Context, Result};
 use iroh::{endpoint::presets, protocol::Router, Endpoint, SecretKey};
-use iroh_blobs::{store::fs::FsStore, BlobsProtocol};
+use iroh_blobs::{
+    store::{
+        fs::{options::Options, FsStore},
+        GcConfig,
+    },
+    BlobsProtocol,
+};
 use iroh_docs::{
     api::protocol::{AddrInfoOptions, ShareMode},
+    engine::ProtectCallbackHandler,
     protocol::Docs,
 };
 use iroh_gossip::net::Gossip;
 use std::path::Path;
+
+/// How often to garbage-collect the blob store. iroh-blobs keeps a
+/// content-addressed copy of every blob, so an edited or deleted file leaves
+/// its old blob orphaned; GC drops blobs no longer referenced by any doc
+/// entry. 30 minutes — GC walks every blob, so not free, but a small folder
+/// makes it cheap.
+const GC_INTERVAL_SECS: u64 = 1800;
 
 /// All the long-lived iroh handles for one running app instance.
 ///
@@ -44,7 +58,18 @@ impl Node {
 
         let blobs_path = iroh_root.join("blobs");
         std::fs::create_dir_all(&blobs_path)?;
-        let store = FsStore::load(&blobs_path)
+
+        // Garbage collection. iroh-docs feeds the set of hashes referenced by
+        // any doc entry through `protect_handler`; iroh-blobs sweeps every
+        // other blob on the interval below. Without this the blob store grows
+        // without bound — each edit and each deleted file orphans a blob.
+        let (protect_handler, protect_cb) = ProtectCallbackHandler::new();
+        let mut store_opts = Options::new(&blobs_path);
+        store_opts.gc = Some(GcConfig {
+            interval: std::time::Duration::from_secs(GC_INTERVAL_SECS),
+            add_protected: Some(protect_cb),
+        });
+        let store = FsStore::load_with_opts(blobs_path.join("blobs.db"), store_opts)
             .await
             .context("failed to open blob store")?;
 
@@ -55,6 +80,7 @@ impl Node {
         let docs_path = iroh_root.join("docs");
         std::fs::create_dir_all(&docs_path)?;
         let docs = Docs::persistent(docs_path)
+            .protect_handler(protect_handler)
             .spawn(endpoint.clone(), (*store).clone(), gossip.clone())
             .await
             .context("failed to spawn docs")?;

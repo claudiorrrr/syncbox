@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use iroh::EndpointAddr;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::fs;
 
@@ -37,6 +38,14 @@ pub struct Config {
     /// If true, this device receives changes but never propagates its own.
     #[serde(default)]
     pub read_only_local: bool,
+    /// If true, syncbox runs menu-bar-only — no Dock icon. Applied at startup
+    /// and whenever the user toggles it in Settings.
+    #[serde(default)]
+    pub hide_dock_icon: bool,
+    /// Last time (unix seconds) each peer was seen online, keyed by endpoint
+    /// id. Persisted so "offline for over a week" survives restarts.
+    #[serde(default)]
+    pub peer_last_seen: HashMap<String, u64>,
 }
 
 /// Fallback pair-server host.

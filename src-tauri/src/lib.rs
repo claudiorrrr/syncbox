@@ -21,7 +21,7 @@ use syncbox_core::{config, pair, peer, sync};
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Manager, State,
+    ActivationPolicy, AppHandle, Emitter, Manager, State,
 };
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_dialog::DialogExt;
@@ -51,6 +51,10 @@ struct Inner {
 
 pub struct AppState {
     inner: Mutex<Inner>,
+    /// The tray "Check for Updates…" item, kept so a background update check
+    /// can relabel it to "Update to vX available". Filled once `build_tray`
+    /// runs; a plain std Mutex since `set_text` is sync and rare.
+    update_item: std::sync::Mutex<Option<MenuItem<tauri::Wry>>>,
 }
 
 #[derive(Debug, Serialize, Clone, Default)]
@@ -64,6 +68,10 @@ struct StatusView {
     peers_online: usize,
     peers_known: usize,
     message: String,
+    /// Endpoint id of the folder's owner (first device to share it), and
+    /// whether this device is that owner.
+    owner_id: Option<String>,
+    is_owner: bool,
     /// App version: semver plus a build number (git commit count), both
     /// resolved at compile time. Shown verbatim in the window footer.
     version: String,
@@ -98,6 +106,7 @@ pub fn run() {
         ))
         .manage(AppState {
             inner: Mutex::new(Inner::default()),
+            update_item: std::sync::Mutex::new(None),
         })
         .setup(|app| {
             build_tray(app.handle().clone())?;
@@ -174,6 +183,41 @@ pub fn run() {
                 }
             });
 
+            // Persist peer last-seen times every minute, so the window can
+            // tell a device that's been gone for a week from one just
+            // briefly offline — in-memory state alone resets on restart.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    let state: State<AppState> = handle.state();
+                    let mut inner = state.inner.lock().await;
+                    let Some(peers) = inner.peers.clone() else {
+                        continue;
+                    };
+                    let online: Vec<String> = {
+                        let p = peers.lock().await;
+                        p.iter()
+                            .filter(|(_, e)| e.online)
+                            .map(|(id, _)| id.clone())
+                            .collect()
+                    };
+                    if online.is_empty() {
+                        continue;
+                    }
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    for id in online {
+                        inner.config.peer_last_seen.insert(id, now);
+                    }
+                    if let Err(e) = config::save(&inner.config).await {
+                        tracing::warn!(error = ?e, "persist peer_last_seen failed");
+                    }
+                }
+            });
+
             Ok(())
         })
         .on_window_event(|win, event| {
@@ -199,6 +243,9 @@ pub fn run() {
             cmd_get_autostart,
             cmd_start_sync,
             cmd_get_storage_size,
+            cmd_set_update_available,
+            cmd_set_hide_dock_icon,
+            cmd_get_hide_dock_icon,
             cmd_block_peer,
             cmd_get_device_name,
             cmd_set_device_name,
@@ -336,6 +383,21 @@ fn status_icon(state: TrayState, frame: u32) -> (Vec<u8>, u32, u32) {
 async fn bootstrap(app: &AppHandle) -> Result<()> {
     let state: State<AppState> = app.state();
     let cfg = config::load().await?;
+
+    // First run / setup not finished: the window is hidden by default (tray
+    // app), but with no folder picked the user has nothing to click and can't
+    // tell syncbox is even running. Surface the window so they can pick a
+    // folder and pair. A configured install stays quietly in the tray.
+    if cfg.folder.is_none() {
+        if let Some(win) = app.get_webview_window("main") {
+            let _ = win.show();
+            let _ = win.set_focus();
+        }
+    }
+
+    // Apply the Dock-icon preference (menu-bar-only when hidden).
+    apply_dock_policy(app, cfg.hide_dock_icon);
+
     let iroh_root = config::iroh_root()?;
     let node = Arc::new(Node::spawn(&iroh_root).await?);
 
@@ -444,6 +506,13 @@ fn build_tray(app: AppHandle) -> Result<()> {
         &app,
         &[&pair_item, &open_item, &update_item, &sep, &quit_item],
     )?;
+
+    // Keep the update item so a background update check can relabel it.
+    app.state::<AppState>()
+        .update_item
+        .lock()
+        .unwrap()
+        .replace(update_item.clone());
 
     let _tray = TrayIconBuilder::with_id("main")
         .icon(
@@ -624,14 +693,28 @@ async fn maybe_start_sync(app: &AppHandle) -> Result<bool> {
 #[tauri::command]
 async fn cmd_get_status(state: State<'_, AppState>) -> Result<StatusView, String> {
     let inner = state.inner.lock().await;
-    let (peers_online, peers_known) = match &inner.peers {
-        Some(map) => {
-            let m = map.lock().await;
-            (m.values().filter(|p| p.online).count(), m.len())
-        }
-        None => (0, 0),
+    let peers_online = match &inner.peers {
+        Some(map) => map.lock().await.values().filter(|p| p.online).count(),
+        None => 0,
+    };
+    // Known = the doc roster (every device that published a name), minus this
+    // one — the whole swarm, not just devices with a live link here.
+    let self_id = inner.node.as_ref().map(|n| n.endpoint.id().to_string());
+    let peers_known = match &inner.names {
+        Some(n) => n
+            .lock()
+            .await
+            .keys()
+            .filter(|id| Some(*id) != self_id.as_ref())
+            .count(),
+        None => 0,
     };
     let message = inner.status.lock().await.clone();
+    let owner_id = match &inner.doc {
+        Some(doc) => sync::owner_id(doc).await.ok().flatten(),
+        None => None,
+    };
+    let is_owner = matches!((&owner_id, &self_id), (Some(o), Some(me)) if o == me);
     Ok(StatusView {
         folder: inner
             .config
@@ -646,6 +729,8 @@ async fn cmd_get_status(state: State<'_, AppState>) -> Result<StatusView, String
         peers_online,
         peers_known,
         message,
+        owner_id,
+        is_owner,
         version: format!(
             "{} (build {})",
             env!("CARGO_PKG_VERSION"),
@@ -664,28 +749,47 @@ async fn cmd_get_log(state: State<'_, AppState>) -> Result<Vec<String>, String> 
 #[tauri::command]
 async fn cmd_get_peers(state: State<'_, AppState>) -> Result<Vec<PeerView>, String> {
     let inner = state.inner.lock().await;
-    let Some(peers) = inner.peers.clone() else {
-        return Ok(vec![]);
-    };
+    let self_id = inner.node.as_ref().map(|n| n.endpoint.id().to_string());
+    let peers = inner.peers.clone();
     let names = inner.names.clone();
     let blocked = inner.blocked.clone();
+    let persisted = inner.config.peer_last_seen.clone();
     drop(inner);
+
     let name_map = match names {
         Some(n) => n.lock().await.clone(),
         None => HashMap::new(),
     };
-    // Devices we've stopped syncing with are hidden from the list entirely —
-    // they reappear only if the user pairs again, which clears the block.
+    let peer_map = match peers {
+        Some(p) => p.lock().await.clone(),
+        None => HashMap::new(),
+    };
+    // Devices we've stopped syncing with are hidden entirely — they reappear
+    // only if the user pairs again, which clears the block.
     let blocked_set = blocked.lock().await.clone();
-    let p = peers.lock().await;
-    let mut out: Vec<PeerView> = p
-        .iter()
-        .filter(|(id, _)| !blocked_set.contains(*id))
-        .map(|(id, e)| PeerView {
-            id: id.clone(),
-            online: e.online,
-            last_seen_unix: e.last_seen_unix,
-            name: name_map.get(id).cloned(),
+
+    // The list is the whole swarm, not just our live links. Every device that
+    // published a name into the doc (`name_map`) is a member, plus anything
+    // we have a connection to. A member with no direct link here is shown
+    // offline — sync still reaches it transitively through other peers.
+    let mut ids: HashSet<String> = name_map.keys().cloned().collect();
+    ids.extend(peer_map.keys().cloned());
+
+    let mut out: Vec<PeerView> = ids
+        .into_iter()
+        .filter(|id| Some(id) != self_id.as_ref())
+        .filter(|id| !blocked_set.contains(id))
+        .map(|id| {
+            let entry = peer_map.get(&id);
+            PeerView {
+                online: entry.map(|e| e.online).unwrap_or(false),
+                last_seen_unix: entry
+                    .map(|e| e.last_seen_unix)
+                    .unwrap_or(0)
+                    .max(persisted.get(&id).copied().unwrap_or(0)),
+                name: name_map.get(&id).cloned(),
+                id,
+            }
         })
         .collect();
     out.sort_by(|a, b| {
@@ -709,6 +813,12 @@ async fn cmd_get_ticket(
         // Create the doc on demand.
         if inner.doc.is_none() {
             let doc = node.docs.create().await.map_err(|e| e.to_string())?;
+            // First to create the doc — this device is the folder's owner.
+            if let Some(author) = inner.author {
+                if let Err(e) = sync::publish_owner(&doc, author, &node).await {
+                    tracing::warn!(error = ?e, "publish owner failed");
+                }
+            }
             inner.doc = Some(doc);
         }
         let doc = inner.doc.clone().unwrap();
@@ -894,6 +1004,12 @@ async fn cmd_make_code(
         let node = inner.node.clone().ok_or("node not ready")?;
         if inner.doc.is_none() {
             let doc = node.docs.create().await.map_err(|e| e.to_string())?;
+            // First to create the doc — this device is the folder's owner.
+            if let Some(author) = inner.author {
+                if let Err(e) = sync::publish_owner(&doc, author, &node).await {
+                    tracing::warn!(error = ?e, "publish owner failed");
+                }
+            }
             inner.doc = Some(doc);
         }
         let doc = inner.doc.clone().unwrap();
@@ -945,8 +1061,14 @@ async fn cmd_use_code(
 
 #[tauri::command]
 async fn cmd_get_storage_size(_state: State<'_, AppState>) -> Result<u64, String> {
-    let root = config::iroh_root().map_err(|e| e.to_string())?;
-    Ok(dir_size(&root))
+    // Size of the synced folder — the content the user actually keeps. Not the
+    // iroh blob store: that holds a second, content-addressed copy of every
+    // blob and would over-report (badly so before GC reclaims orphaned blobs).
+    let cfg = config::load().await.map_err(|e| e.to_string())?;
+    match cfg.folder {
+        Some(folder) => Ok(dir_size(&folder)),
+        None => Ok(0),
+    }
 }
 
 fn dir_size(path: &std::path::Path) -> u64 {
@@ -960,6 +1082,57 @@ fn dir_size(path: &std::path::Path) -> u64 {
         }
     }
     total
+}
+
+/// Relabel the tray "Check for Updates…" item. `Some(version)` →
+/// "Update to vX available"; `None` → reset. The webview calls this after a
+/// background update check, so the menu-bar surface nudges without a modal.
+#[tauri::command]
+fn cmd_set_update_available(state: State<'_, AppState>, version: Option<String>) {
+    if let Ok(guard) = state.update_item.lock() {
+        if let Some(item) = guard.as_ref() {
+            let text = match version {
+                Some(v) => format!("Update to {v} available"),
+                None => "Check for Updates…".to_string(),
+            };
+            let _ = item.set_text(text);
+        }
+    }
+}
+
+/// Apply the Dock-icon preference. `Accessory` = menu-bar-only, no Dock icon;
+/// `Regular` = normal app with a Dock icon.
+fn apply_dock_policy(app: &AppHandle, hide: bool) {
+    let policy = if hide {
+        ActivationPolicy::Accessory
+    } else {
+        ActivationPolicy::Regular
+    };
+    if let Err(e) = app.set_activation_policy(policy) {
+        tracing::warn!(error = ?e, "set activation policy failed");
+    }
+}
+
+#[tauri::command]
+async fn cmd_set_hide_dock_icon(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    {
+        let mut inner = state.inner.lock().await;
+        inner.config.hide_dock_icon = enabled;
+        config::save(&inner.config)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    apply_dock_policy(&app, enabled);
+    Ok(())
+}
+
+#[tauri::command]
+async fn cmd_get_hide_dock_icon(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.inner.lock().await.config.hide_dock_icon)
 }
 
 /// Stop syncing with a device: ignore its changes, hide it from the list, and

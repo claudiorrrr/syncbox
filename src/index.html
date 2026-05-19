@@ -8,130 +8,161 @@
   </head>
   <body>
     <main>
+      <div id="update-banner" class="update-banner" hidden>
+        <span id="update-banner-text">A new version of syncbox is available.</span>
+        <button id="btn-update-install">Install &amp; restart</button>
+      </div>
+
       <header>
+        <button id="btn-back" class="icon-btn invisible" title="Back" aria-label="Back">‹</button>
         <h1>syncbox</h1>
-        <input
-          id="device-name"
-          class="device-name"
-          type="text"
-          maxlength="40"
-          placeholder="Name this device"
-          aria-label="This device's name"
-          title="The name other devices see for this one. Click to rename."
-        />
+        <button id="btn-settings" class="icon-btn invisible" title="Settings" aria-label="Settings">⚙</button>
       </header>
 
-      <section class="card">
-        <h2>1. Folder</h2>
-        <p class="muted">Pick one folder. Everything inside it syncs to paired devices.</p>
-        <div class="row">
-          <code id="folder-path" class="path">(not set)</code>
-          <button id="btn-choose-folder">Choose folder…</button>
-        </div>
-        <button class="link" id="btn-open-folder" hidden>Reveal in Finder</button>
+      <!-- ===== SETUP — step 1: choose a folder ===== -->
+      <section id="view-folder" class="view" hidden>
+        <p class="step">Step 1 of 2</p>
+        <h2>Pick a folder to sync</h2>
+        <p class="muted">
+          Everything inside this folder syncs to your other Macs.
+        </p>
+        <button id="btn-choose-folder">Choose folder…</button>
       </section>
 
-      <section class="card">
-        <h2>2. Pair</h2>
-        <p class="muted">
-          On the first device, click <em>Get code</em>. Type those 6
-          characters into the second device, then click <em>Use code</em>.
+      <!-- ===== ADD A DEVICE ===== -->
+      <section id="view-adddevice" class="view" hidden>
+        <p class="step" id="adddevice-step" hidden>Step 2 of 2</p>
+        <h2>Add a device</h2>
+
+        <div id="adddevice-choice">
+          <p class="muted">Connect another Mac to sync this folder with.</p>
+          <button id="btn-show-code" class="choice">
+            <strong>Show a code</strong>
+            <span class="muted small">On this Mac — type it into the other one</span>
+          </button>
+          <button id="btn-enter-code" class="choice">
+            <strong>Enter a code</strong>
+            <span class="muted small">You already have a code from another Mac</span>
+          </button>
+        </div>
+
+        <div id="panel-show-code" hidden>
+          <button class="link adddevice-back">‹ Back</button>
+          <p class="muted">Type this code into the other Mac within 5 minutes.</p>
+          <div class="code-display">
+            <span id="our-code" class="code">— — —</span>
+            <span id="code-expiry" class="muted small"></span>
+          </div>
+          <div class="row">
+            <button id="btn-make-code">Get code</button>
+            <button id="btn-copy-code">Copy</button>
+          </div>
+          <label class="checkbox">
+            <input type="checkbox" id="ticket-read-only" />
+            <span>Read-only — the other Mac receives changes but can't send any back</span>
+          </label>
+        </div>
+
+        <div id="panel-enter-code" hidden>
+          <button class="link adddevice-back">‹ Back</button>
+          <label class="block">
+            <span>Code from the other Mac</span>
+            <input id="join-code" type="text" maxlength="7" placeholder="ABC-123" autocapitalize="characters" />
+          </label>
+          <button id="btn-use-code">Connect</button>
+          <p id="pair-result" class="pair-result"></p>
+        </div>
+      </section>
+
+      <!-- ===== RUNNING ===== -->
+      <section id="view-running" class="view" hidden>
+        <div class="folder-head">
+          <span class="folder-head-icon" aria-hidden="true">📁</span>
+          <span id="run-folder" class="folder-head-name">folder</span>
+          <div class="run-status">
+            <span id="status-icon" class="run-icon ok" aria-hidden="true">✓</span>
+            <span id="status-line">Up to date</span>
+          </div>
+          <p id="status-sub" class="run-sub muted small"></p>
+          <p id="run-owner" class="run-sub muted small" hidden></p>
+        </div>
+
+        <h2>Devices</h2>
+        <ul id="device-list" class="devices"></ul>
+        <p id="no-devices" class="muted small" hidden>
+          No devices yet — add one below.
         </p>
 
-        <div class="code-display">
-          <span id="our-code" class="code">— — —</span>
-          <span id="code-expiry" class="muted small"></span>
-        </div>
-        <div class="row">
-          <button id="btn-make-code">Get code</button>
-          <button id="btn-copy-code">Copy</button>
-        </div>
-        <label class="checkbox">
-          <input type="checkbox" id="ticket-read-only" />
-          <span>Read-only code — the other device receives changes but can't send any back</span>
-        </label>
+        <button id="btn-add-device" class="link">+ Add a device</button>
+      </section>
 
-        <hr />
+      <!-- ===== SETTINGS ===== -->
+      <section id="view-settings" class="view" hidden>
+        <h2>Settings</h2>
 
         <label class="block">
-          <span>Have a code from another device?</span>
-          <input id="join-code" type="text" maxlength="7" placeholder="ABC-123" autocapitalize="characters" />
+          <span>This device's name</span>
+          <input id="device-name" class="plain-input" type="text" maxlength="40" placeholder="Name this device" />
         </label>
-        <button id="btn-use-code">Use code</button>
-        <p id="pair-result" class="pair-result"></p>
+
+        <div class="setting">
+          <span class="setting-label">Synced folder</span>
+          <code id="folder-path" class="path">(not set)</code>
+          <div class="row">
+            <button id="btn-choose-folder-2">Change folder…</button>
+            <button id="btn-open-folder" class="link" hidden>Reveal in Finder</button>
+          </div>
+        </div>
+
+        <label class="checkbox">
+          <input type="checkbox" id="autostart" />
+          <span>Launch syncbox at login</span>
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" id="hide-dock" />
+          <span>Hide the Dock icon — run from the menu bar only</span>
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" id="read-only-local" />
+          <span>Make this device read-only — changes made here won't sync out</span>
+        </label>
+
+        <button id="btn-write-ignore" class="link">Create .syncboxignore in folder</button>
+
+        <p class="muted small" id="storage-line">Storage: —</p>
 
         <details class="advanced">
-          <summary>Advanced: paste raw ticket</summary>
+          <summary>Advanced</summary>
           <label class="block">
             <span>This device's ticket</span>
-            <textarea id="our-ticket" readonly placeholder="Click Show ticket below"></textarea>
+            <textarea id="our-ticket" readonly placeholder="Click Show ticket"></textarea>
           </label>
           <div class="row">
             <button id="btn-make-ticket">Show ticket</button>
             <button id="btn-copy-ticket">Copy</button>
           </div>
           <label class="block">
-            <span>Join another device</span>
-            <textarea id="join-ticket" placeholder="Paste ticket here"></textarea>
+            <span>Join with a raw ticket</span>
+            <textarea id="join-ticket" placeholder="Paste a ticket here"></textarea>
           </label>
           <button id="btn-join">Join</button>
-
+          <p id="pair-result-adv" class="pair-result"></p>
           <hr />
-
           <label class="block">
             <span>Pair server URL</span>
-            <input id="pair-server" type="text" placeholder="https://syncbox-pair.you.workers.dev" />
+            <input id="pair-server" class="plain-input" type="text" placeholder="https://…" />
           </label>
           <button id="btn-save-pair-server">Save server URL</button>
         </details>
-      </section>
 
-      <section class="card">
-        <h2>3. Run</h2>
-        <p>
-          Status: <strong id="status-text">checking…</strong>
-        </p>
-        <p class="muted small">
-          Paired devices: <span id="peer-count">—</span>
-        </p>
-        <ul id="peer-list" class="peers"></ul>
-        <p class="muted small">
-          Storage used: <span id="storage-size">—</span>
-        </p>
-        <p class="muted small">
-          Download: <span id="xfer-rate">idle</span>
-        </p>
-        <label class="checkbox">
-          <input type="checkbox" id="autostart" />
-          <span>Launch syncbox at login</span>
-        </label>
-        <label class="checkbox">
-          <input type="checkbox" id="read-only-local" />
-          <span>Make this device read-only — changes made here won't sync out</span>
-        </label>
-        <div class="row">
-          <button id="btn-write-ignore" class="link">
-            Create .syncboxignore in folder
-          </button>
-        </div>
-      </section>
-
-      <section class="card">
         <details>
           <summary>Debug log</summary>
           <pre id="debug-log" class="debug-log">(no activity yet)</pre>
           <button id="btn-copy-log" class="link">Copy log</button>
         </details>
-      </section>
 
-      <footer class="muted small">
-        <p>
-          If two devices change the same file at once, both are kept — the
-          incoming copy as
-          <code>name.conflict-&lt;host&gt;-&lt;timestamp&gt;.ext</code>.
-        </p>
-        <p>syncbox <span id="app-version">—</span></p>
-      </footer>
+        <p class="muted small version">syncbox <span id="app-version">—</span></p>
+      </section>
     </main>
 
     <script type="module" src="./main.js"></script>

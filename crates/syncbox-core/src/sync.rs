@@ -49,6 +49,12 @@ const RECONCILE_DEBOUNCE_MS: u64 = 400;
 /// time. Both passes are idempotent and content-hash gated.
 const SWEEP_SECS: u64 = 30;
 
+/// A peer counts as online if we've completed a doc sync (or seen a gossip
+/// neighbour event) with it within this window. iroh-docs re-syncs reachable
+/// peers about every 30s, so 90s tolerates a couple of missed rounds before
+/// the device drops to "idle".
+const PEER_STALE_SECS: u64 = 90;
+
 /// Key prefix for reserved entries that carry a device's display name. A real
 /// file key is a relative path, which can never start with a NUL byte, so
 /// these never collide with synced files.
@@ -288,6 +294,20 @@ pub async fn run(state: SyncState, shutdown: tokio::sync::watch::Receiver<bool>)
             }
 
             _ = sweep.tick() => {
+                // Age out peers we haven't sync'd with recently: a dropped
+                // link fires no event, so an online flag would otherwise
+                // stick forever.
+                {
+                    let now = now_unix();
+                    let mut peers = state.peers.lock().await;
+                    for e in peers.values_mut() {
+                        if e.online
+                            && now.saturating_sub(e.last_seen_unix) > PEER_STALE_SECS
+                        {
+                            e.online = false;
+                        }
+                    }
+                }
                 // Heal a dropped or never-formed peer link: start_sync runs
                 // once at launch, so a peer unreachable then stays unreached
                 // until restart. Re-attempt while no peer is online.
@@ -366,9 +386,12 @@ async fn reconnect_peers(state: &SyncState) {
             }
         }
     }
-    // Don't dial peers we've stopped syncing with.
+    // Don't dial peers we've stopped syncing with — nor ourselves (a peer can
+    // report our own address back into the doc ticket, and iroh rejects a
+    // self-connection with "Connecting to ourself is not supported").
     let blocked = state.blocked.lock().await.clone();
-    peers.retain(|p| !blocked.contains(&p.id.to_string()));
+    let self_id = state.node.endpoint.id();
+    peers.retain(|p| p.id != self_id && !blocked.contains(&p.id.to_string()));
     if peers.is_empty() {
         return;
     }
@@ -812,7 +835,21 @@ async fn handle_event(state: &SyncState, ev: LiveEvent) -> bool {
             state.stats.lock().await.pending_downloads = 0;
             true
         }
-        LiveEvent::SyncFinished(_) => true,
+        LiveEvent::SyncFinished(ev) => {
+            // A completed doc sync is proof the peer is reachable — mark it
+            // online even when no gossip NeighborUp ever fired (gossip and
+            // doc-sync are separate channels; gossip often doesn't form).
+            if ev.result.is_ok() {
+                state.peers.lock().await.insert(
+                    ev.peer.to_string(),
+                    PeerEntry {
+                        online: true,
+                        last_seen_unix: now_unix(),
+                    },
+                );
+            }
+            true
+        }
         LiveEvent::NeighborUp(pk) => {
             {
                 let mut peers = state.peers.lock().await;
@@ -870,10 +907,13 @@ async fn reconcile_remote(state: &SyncState) -> Result<()> {
                 continue;
             }
         };
-        // Reserved name entries are device metadata, not files — record the
-        // name and never mirror them to disk.
-        if entry.key().starts_with(NAME_KEY_PREFIX) {
-            record_device_name(state, &entry).await;
+        // Reserved entries (keys starting with NUL — names, owner, …) are
+        // device metadata, not files. Record the ones we track, and never
+        // mirror any of them to disk.
+        if entry.key().starts_with(b"\x00") {
+            if entry.key().starts_with(NAME_KEY_PREFIX) {
+                record_device_name(state, &entry).await;
+            }
             continue;
         }
         if entry.is_empty() {
@@ -893,6 +933,47 @@ async fn reconcile_remote(state: &SyncState) -> Result<()> {
         set_status(state, format!("received {wrote} file(s)")).await;
     }
     Ok(())
+}
+
+/// Reserved key prefix recording the folder's owner — the device that first
+/// created the doc. The owner's endpoint id is encoded in the key itself, so
+/// recovering it needs no blob read. Written once at creation, never updated.
+const OWNER_KEY_PREFIX: &[u8] = b"\x00owner/";
+
+/// Mark this device as the folder's owner. Called once, by the device that
+/// creates the doc (the first participant). A no-op if an owner is already
+/// recorded — joiners never overwrite it.
+pub async fn publish_owner(doc: &Doc, author: AuthorId, node: &Node) -> Result<()> {
+    if owner_id(doc).await?.is_some() {
+        return Ok(());
+    }
+    let id = node.endpoint.id().to_string();
+    let mut key = OWNER_KEY_PREFIX.to_vec();
+    key.extend_from_slice(id.as_bytes());
+    doc.set_bytes(author, Bytes::from(key), Bytes::from_static(b"1"))
+        .await
+        .context("publish owner")?;
+    Ok(())
+}
+
+/// The folder owner's endpoint id, if one is recorded in the doc.
+pub async fn owner_id(doc: &Doc) -> Result<Option<String>> {
+    let stream = doc
+        .get_many(Query::single_latest_per_key().key_prefix(OWNER_KEY_PREFIX))
+        .await?;
+    tokio::pin!(stream);
+    while let Some(entry) = stream.next().await {
+        let entry = entry?;
+        if entry.is_empty() {
+            continue;
+        }
+        if let Some(id) = entry.key().strip_prefix(OWNER_KEY_PREFIX) {
+            if let Ok(s) = std::str::from_utf8(id) {
+                return Ok(Some(s.to_string()));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Publish a device's display name into the doc under its reserved key, so
