@@ -16,7 +16,7 @@
 //!   local file, unless the local copy was edited after the delete was
 //!   issued — then the edit wins and is re-published.
 
-use crate::{conflict, ignore_patterns::IgnoreSet, peer::Node};
+use crate::{config, conflict, ignore_patterns::IgnoreSet, peer::Node};
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use futures_lite::StreamExt;
@@ -25,10 +25,13 @@ use iroh_blobs::{
     api::blobs::{ExportMode, ImportMode},
     Hash,
 };
-use iroh_docs::{api::Doc, engine::LiveEvent, store::Query, AuthorId, ContentStatus, Entry};
+use iroh_docs::{
+    api::Doc, engine::LiveEvent, store::Query, AuthorId, ContentStatus, DocTicket, Entry,
+};
 use notify::{EventKind, RecursiveMode};
 use notify_debouncer_full::new_debouncer;
 use serde::Serialize;
+use std::str::FromStr;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -261,6 +264,13 @@ pub async fn run(state: SyncState, shutdown: tokio::sync::watch::Receiver<bool>)
             }
 
             _ = sweep.tick() => {
+                // Heal a dropped or never-formed peer link: start_sync runs
+                // once at launch, so a peer unreachable then stays unreached
+                // until restart. Re-attempt while no peer is online.
+                let connected = state.peers.lock().await.values().any(|e| e.online);
+                if !connected {
+                    reconnect_peers(&state).await;
+                }
                 if let Err(e) = reconcile_remote(&state).await {
                     tracing::warn!(error = ?e, "periodic reconcile failed");
                 }
@@ -307,6 +317,40 @@ fn spawn_watcher(
     )?;
     debouncer.watch(&root, RecursiveMode::Recursive)?;
     Ok(debouncer)
+}
+
+/// Re-attempt connecting to every known peer. `doc.start_sync` runs once at
+/// launch; if a peer was unreachable then (asleep, offline, address changed)
+/// the link never forms until a restart. The sweep calls this while the
+/// device is isolated, so a connection heals on its own — a paired peer stays
+/// a peer until one side stops syncing, no re-pairing needed.
+async fn reconnect_peers(state: &SyncState) {
+    let cfg = match config::load().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = ?e, "reconnect: config load failed");
+            return;
+        }
+    };
+    let mut peers: Vec<EndpointAddr> = cfg.known_peers;
+    if let Some(t) = &cfg.doc_ticket {
+        if let Ok(ticket) = DocTicket::from_str(t) {
+            for addr in ticket.nodes {
+                if !peers.iter().any(|p| p.id == addr.id) {
+                    peers.push(addr);
+                }
+            }
+        }
+    }
+    // Don't dial peers we've stopped syncing with.
+    let blocked = state.blocked.lock().await.clone();
+    peers.retain(|p| !blocked.contains(&p.id.to_string()));
+    if peers.is_empty() {
+        return;
+    }
+    if let Err(e) = state.doc.start_sync(peers).await {
+        tracing::warn!(error = ?e, "periodic start_sync failed");
+    }
 }
 
 // ---------- local → doc ----------
