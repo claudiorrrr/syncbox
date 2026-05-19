@@ -102,10 +102,12 @@ testing). `config.json` + `iroh/` (secret key, blob store, docs DB).
 `config.json` holds a `folders` list — each `FolderConfig` is one synced
 folder (local `path` + its own doc `namespace_id`/`doc_ticket`). A device can
 sync several; each folder is an independent iroh-docs namespace over the one
-shared `Node`. The CLI's `run` drives a `sync::run` loop per folder; the GUI
-is still single-folder and operates on `folders[0]` via `Config::primary()`.
-`config::load()` migrates pre-0.3.1 single-folder configs (top-level
-`folder`/`doc_ticket`/`namespace_id`) into the list on first load.
+shared `Node`. Both front-ends run one `sync::run` loop per folder: the CLI's
+`run` over every folder, the GUI via a `FolderRuntime` per folder in
+`src-tauri`'s `Inner` (index-aligned with `config.folders`; the window shows
+one at a time and switches). `config::load()` migrates pre-0.3.1 single-folder
+configs (top-level `folder`/`doc_ticket`/`namespace_id`) into the list on
+first load.
 
 ## Gotchas
 
