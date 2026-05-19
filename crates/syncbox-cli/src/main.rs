@@ -4,18 +4,23 @@
 //! Linux servers and headless machines: pair once, then run `syncbox run`
 //! under systemd.
 //!
+//! A device can sync several folders at once. Each folder is one iroh-docs
+//! namespace; `syncbox run` drives a sync loop for every folder over one
+//! shared iroh endpoint.
+//!
 //! Typical flow:
-//!   device A:  syncbox init ~/Sync && syncbox pair      -> prints a code
-//!   device B:  syncbox join ABC-123 && syncbox init ~/Sync
-//!   both:      syncbox run                              (or via systemd)
+//!   device A:  syncbox init ~/Sync && syncbox pair       -> prints a code
+//!   device B:  syncbox join ABC-123 ~/Sync
+//!   both:      syncbox run                               (or via systemd)
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use futures_lite::StreamExt;
+use iroh::EndpointAddr;
 use iroh_docs::{api::Doc, store::Query, DocTicket, NamespaceId};
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     str::FromStr,
     sync::{atomic::AtomicU32, Arc},
     time::{SystemTime, UNIX_EPOCH},
@@ -27,7 +32,7 @@ use syncbox_core::{
     peer::{self, Node},
     sync::{self, SyncState},
 };
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 
 #[derive(Parser)]
 #[command(
@@ -42,42 +47,58 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Set the folder to sync (creates it if missing).
+    /// Start syncing a local folder (creates it if missing).
     Init {
         /// Path to the folder.
         folder: PathBuf,
     },
-    /// Create a pairing code other devices can use to join this folder.
+    /// Create a pairing code other devices can use to join one of your folders.
     Pair {
         /// Share read-only: joiners receive changes but can't push their own.
         #[arg(long)]
         read_only: bool,
+        /// Which folder to share, by path. Optional when only one is synced.
+        folder: Option<PathBuf>,
     },
-    /// Join a folder shared from another device, using its pairing code.
+    /// Join a folder shared from another device: redeem its code into a path.
     Join {
         /// The 6-character code, e.g. ABC-123.
         code: String,
+        /// Local folder to sync the shared content into (created if missing).
+        folder: PathBuf,
     },
-    /// Run the sync engine in the foreground (use this under systemd).
+    /// Run the sync engine for every folder in the foreground (use under systemd).
     Run,
-    /// Show current configuration and pairing state.
+    /// Show configuration and pairing state for every folder.
     Status,
-    /// Dump every entry in the synced doc (diagnostics).
-    Dump,
+    /// List the synced folders.
+    List,
+    /// Stop syncing a folder. Local files are left in place.
+    Remove {
+        /// Path of the folder to drop.
+        folder: PathBuf,
+    },
+    /// Dump every entry in a folder's doc (diagnostics).
+    Dump {
+        /// Which folder, by path. Optional when only one is synced.
+        folder: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Init { folder } => do_init(folder).await,
-        Cmd::Pair { read_only } => do_pair(read_only).await,
-        Cmd::Join { code } => do_join(code).await,
+        Cmd::Pair { read_only, folder } => do_pair(read_only, folder).await,
+        Cmd::Join { code, folder } => do_join(code, folder).await,
         Cmd::Run => {
             init_tracing();
             run_sync().await
         }
         Cmd::Status => do_status().await,
-        Cmd::Dump => do_dump().await,
+        Cmd::List => do_list().await,
+        Cmd::Remove { folder } => do_remove(folder).await,
+        Cmd::Dump { folder } => do_dump(folder).await,
     }
 }
 
@@ -90,24 +111,29 @@ async fn do_init(folder: PathBuf) -> Result<()> {
         .canonicalize()
         .context("resolve the folder's absolute path")?;
     let mut cfg = config::load().await?;
-    cfg.folder = Some(folder.clone());
+    if cfg
+        .folders
+        .iter()
+        .any(|f| f.path.as_deref() == Some(folder.as_path()))
+    {
+        println!("Already syncing: {}", folder.display());
+        return Ok(());
+    }
+    cfg.folders
+        .push(config::FolderConfig::for_path(folder.clone()));
     config::save(&cfg).await?;
-    println!("Sync folder set: {}", folder.display());
+    println!("Now syncing: {}", folder.display());
+    println!("Next:  syncbox pair   (to add another device)");
     Ok(())
 }
 
-async fn do_pair(read_only: bool) -> Result<()> {
+async fn do_pair(read_only: bool, folder: Option<PathBuf>) -> Result<()> {
     let mut cfg = config::load().await?;
-    if cfg.folder.is_none() {
-        eprintln!(
-            "warning: no folder set — run `syncbox init <folder>` so this device \
-             has something to share"
-        );
-    }
+    let idx = resolve_folder(&cfg, folder.as_deref())?;
     let node = spawn_node().await?;
 
-    // Reuse the existing doc if we already have one; otherwise create it.
-    let doc = match open_doc(&node, &mut cfg).await? {
+    // Reuse the folder's existing doc if it has one; otherwise create it.
+    let doc = match open_doc(&node, &mut cfg.folders[idx]).await? {
         Some(d) => d,
         None => node.docs.create().await.context("create doc")?,
     };
@@ -115,8 +141,8 @@ async fn do_pair(read_only: bool) -> Result<()> {
     let ticket = doc.share(mode, opts).await.context("share doc")?;
     let ticket_str = ticket.to_string();
 
-    cfg.namespace_id = Some(doc.id().to_string());
-    cfg.doc_ticket = Some(ticket_str.clone());
+    cfg.folders[idx].namespace_id = Some(doc.id().to_string());
+    cfg.folders[idx].doc_ticket = Some(ticket_str.clone());
     config::save(&cfg).await?;
 
     let server = pair::resolve_server(cfg.pair_server_url.as_deref());
@@ -128,11 +154,17 @@ async fn do_pair(read_only: bool) -> Result<()> {
     println!("Pairing code:  {}", pc.code);
     println!("Expires in:    {mins} min");
     println!();
-    println!("On the other device:  syncbox join {}", pc.code);
+    println!("On the other device:  syncbox join {} <folder>", pc.code);
     Ok(())
 }
 
-async fn do_join(code: String) -> Result<()> {
+async fn do_join(code: String, folder: PathBuf) -> Result<()> {
+    std::fs::create_dir_all(&folder)
+        .with_context(|| format!("create folder {}", folder.display()))?;
+    let folder = folder
+        .canonicalize()
+        .context("resolve the folder's absolute path")?;
+
     let mut cfg = config::load().await?;
     let server = pair::resolve_server(cfg.pair_server_url.as_deref());
     let ticket_str = pair::redeem_code(&server, &code)
@@ -143,85 +175,139 @@ async fn do_join(code: String) -> Result<()> {
     let ticket =
         DocTicket::from_str(ticket_str.trim()).context("pair server returned an invalid ticket")?;
     let doc = node.docs.import(ticket).await.context("import doc")?;
+    let namespace = doc.id().to_string();
+    let ticket_str = ticket_str.trim().to_string();
 
-    cfg.namespace_id = Some(doc.id().to_string());
-    cfg.doc_ticket = Some(ticket_str.trim().to_string());
-    config::save(&cfg).await?;
-
-    println!("Paired — joined the shared folder.");
-    if cfg.folder.is_none() {
-        println!("Next:  syncbox init <folder>   then   syncbox run");
-    } else {
-        println!("Next:  syncbox run");
+    // If this namespace is already in the config (re-joining), just attach the
+    // local path; otherwise add it as a new folder.
+    match cfg
+        .folders
+        .iter_mut()
+        .find(|f| f.namespace_id.as_deref() == Some(namespace.as_str()))
+    {
+        Some(f) => {
+            f.path = Some(folder.clone());
+            f.doc_ticket = Some(ticket_str);
+            println!(
+                "Already had that folder — set its local path to {}",
+                folder.display()
+            );
+        }
+        None => {
+            cfg.folders.push(config::FolderConfig {
+                path: Some(folder.clone()),
+                doc_ticket: Some(ticket_str),
+                namespace_id: Some(namespace),
+                read_only: false,
+            });
+            println!("Joined shared folder → {}", folder.display());
+        }
     }
+    config::save(&cfg).await?;
+    println!("Next:  syncbox run");
     Ok(())
 }
 
 async fn run_sync() -> Result<()> {
     let mut cfg = config::load().await?;
-    let folder = cfg
-        .folder
-        .clone()
-        .context("no folder set — run `syncbox init <folder>` first")?;
-    if !folder.is_dir() {
-        bail!("sync folder {} does not exist", folder.display());
+    if cfg.folders.is_empty() {
+        bail!("no folders — run `syncbox init <folder>` first");
     }
 
     let node = spawn_node().await?;
     // Stable doc author, persisted by iroh-docs across restarts. Must not
     // rotate: doc.del's prefix delete is author-scoped, so a fresh author each
-    // run cannot delete folders an earlier run published.
+    // run cannot delete folders an earlier run published. Shared by all folders.
     let author = node.docs.author_default().await.context("default author")?;
 
-    let doc = open_doc(&node, &mut cfg)
-        .await?
-        .context("not paired — run `syncbox pair` or `syncbox join` first")?;
+    // One address sink for every folder; the persister below dedupes new peer
+    // addresses into the device-global known_peers list.
+    let (addr_tx, mut addr_rx) = mpsc::unbounded_channel::<EndpointAddr>();
+    let known = cfg.known_peers.clone();
 
-    // Tell iroh-docs who to sync with. `open_doc` attaches the local replica
-    // via `open`, which — unlike `import` — does not start a sync session, so
-    // this step is what actually connects us. Two address sources: peers seen
-    // in earlier sessions (known_peers) and the nodes embedded in the pairing
-    // ticket (the only source right after a fresh `join`).
-    let mut peers = cfg.known_peers.clone();
-    if let Some(t) = &cfg.doc_ticket {
-        if let Ok(ticket) = DocTicket::from_str(t) {
-            for addr in ticket.nodes {
-                if !peers.iter().any(|p| p.id == addr.id) {
-                    peers.push(addr);
+    let mut shutdowns: Vec<watch::Sender<bool>> = Vec::new();
+    let mut handles = Vec::new();
+
+    for idx in 0..cfg.folders.len() {
+        let folder_path = match cfg.folders[idx].path.clone() {
+            Some(p) if p.is_dir() => p,
+            Some(p) => {
+                tracing::warn!(folder = %p.display(), "folder missing on disk, skipping");
+                continue;
+            }
+            None => {
+                tracing::warn!(index = idx, "folder has no local path, skipping");
+                continue;
+            }
+        };
+
+        let doc = match open_doc(&node, &mut cfg.folders[idx]).await? {
+            Some(d) => d,
+            None => {
+                tracing::warn!(folder = %folder_path.display(), "folder not paired, skipping");
+                continue;
+            }
+        };
+
+        // Connect to peers we knew before plus the nodes in this folder's
+        // ticket (the only source right after a fresh `join`).
+        let mut peers = known.clone();
+        if let Some(t) = &cfg.folders[idx].doc_ticket {
+            if let Ok(ticket) = DocTicket::from_str(t) {
+                for addr in ticket.nodes {
+                    if !peers.iter().any(|p| p.id == addr.id) {
+                        peers.push(addr);
+                    }
                 }
             }
         }
-    }
-    if !peers.is_empty() {
-        let n = peers.len();
-        match doc.start_sync(peers).await {
-            Ok(()) => tracing::info!(count = n, "started sync with peers"),
-            Err(e) => tracing::warn!(error = ?e, "start_sync failed"),
+        if !peers.is_empty() {
+            let n = peers.len();
+            match doc.start_sync(peers).await {
+                Ok(()) => {
+                    tracing::info!(count = n, folder = %folder_path.display(), "started sync")
+                }
+                Err(e) => tracing::warn!(error = ?e, "start_sync failed"),
+            }
         }
+
+        let ignores = Arc::new(IgnoreSet::load(&folder_path).context("load ignore set")?);
+        let read_only = cfg.read_only_local || cfg.folders[idx].read_only;
+
+        let st = SyncState {
+            node: node.clone(),
+            doc,
+            author,
+            root: folder_path.clone(),
+            host: cfg.display_name(),
+            echo: Arc::new(Mutex::new(HashMap::new())),
+            peers: Arc::new(Mutex::new(HashMap::new())),
+            addr_sink: addr_tx.clone(),
+            ignores,
+            read_only,
+            blocked: Arc::new(Mutex::new(cfg.blocked_peers.iter().cloned().collect())),
+            active: Arc::new(AtomicU32::new(0)),
+            stats: Arc::new(Mutex::new(Default::default())),
+            status: Arc::new(Mutex::new(String::new())),
+            log: Arc::new(Mutex::new(Default::default())),
+            names: Arc::new(Mutex::new(HashMap::new())),
+            fp_cache: Default::default(),
+        };
+        let (tx, rx) = watch::channel(false);
+        shutdowns.push(tx);
+        handles.push(tokio::spawn(async move { sync::run(st, rx).await }));
+        tracing::info!(folder = %folder_path.display(), "syncing");
     }
 
-    let ignores = Arc::new(IgnoreSet::load(&folder).context("load ignore set")?);
-    let (addr_tx, mut addr_rx) = tokio::sync::mpsc::unbounded_channel::<iroh::EndpointAddr>();
+    // Drop our own sender; the per-folder clones in each SyncState keep the
+    // channel open until every sync loop has stopped.
+    drop(addr_tx);
 
-    let st = SyncState {
-        node: node.clone(),
-        doc,
-        author,
-        root: folder,
-        host: cfg.display_name(),
-        echo: Arc::new(Mutex::new(HashMap::new())),
-        peers: Arc::new(Mutex::new(HashMap::new())),
-        addr_sink: addr_tx,
-        ignores,
-        read_only: cfg.read_only_local,
-        blocked: Arc::new(Mutex::new(cfg.blocked_peers.iter().cloned().collect())),
-        active: Arc::new(AtomicU32::new(0)),
-        stats: Arc::new(Mutex::new(Default::default())),
-        status: Arc::new(Mutex::new(String::new())),
-        log: Arc::new(Mutex::new(Default::default())),
-        names: Arc::new(Mutex::new(HashMap::new())),
-        fp_cache: Default::default(),
-    };
+    if handles.is_empty() {
+        bail!("no folder ready to sync — check `syncbox status`");
+    }
+    // open_doc may have discovered namespace ids via import; persist them.
+    config::save(&cfg).await?;
 
     // Persist freshly-seen peer addresses so the next restart can reconnect
     // without waiting on discovery.
@@ -240,35 +326,25 @@ async fn run_sync() -> Result<()> {
         }
     });
 
-    let (tx, rx) = watch::channel(false);
-    let sync_task = tokio::spawn(async move { sync::run(st, rx).await });
-
     tokio::signal::ctrl_c().await.ok();
     tracing::info!("shutdown requested");
-    let _ = tx.send(true);
-    match sync_task.await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::error!(error = ?e, "sync exited with error"),
-        Err(e) => tracing::error!(error = ?e, "sync task panicked"),
+    for tx in &shutdowns {
+        let _ = tx.send(true);
+    }
+    for h in handles {
+        match h.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::error!(error = ?e, "sync exited with error"),
+            Err(e) => tracing::error!(error = ?e, "sync task panicked"),
+        }
     }
     Ok(())
 }
 
 async fn do_status() -> Result<()> {
     let cfg = config::load().await?;
-    let folder = cfg
-        .folder
-        .as_ref()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "(not set)".into());
-    let paired = cfg.namespace_id.is_some() || cfg.doc_ticket.is_some();
-
     println!("hostname:      {}", cfg.hostname);
-    println!("folder:        {folder}");
-    println!("paired:        {}", if paired { "yes" } else { "no" });
-    if let Some(id) = &cfg.namespace_id {
-        println!("namespace:     {id}");
-    }
+    println!("device:        {}", cfg.display_name());
     println!("read-only:     {}", cfg.read_only_local);
     println!("known peers:   {}", cfg.known_peers.len());
     if !cfg.blocked_peers.is_empty() {
@@ -278,17 +354,74 @@ async fn do_status() -> Result<()> {
         "pair server:   {}",
         pair::resolve_server(cfg.pair_server_url.as_deref())
     );
+
+    if cfg.folders.is_empty() {
+        println!();
+        println!("no folders — run `syncbox init <folder>`");
+        return Ok(());
+    }
+    println!();
+    println!("folders ({}):", cfg.folders.len());
+    for f in &cfg.folders {
+        let path = f
+            .path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(no local path)".into());
+        let paired = f.namespace_id.is_some() || f.doc_ticket.is_some();
+        println!("  • {path}");
+        println!("      paired:    {}", if paired { "yes" } else { "no" });
+        if f.read_only {
+            println!("      read-only: yes");
+        }
+        if let Some(id) = &f.namespace_id {
+            println!("      namespace: {id}");
+        }
+    }
     Ok(())
 }
 
-/// Dump every entry in the synced doc — keys, tombstones, hashes, authors.
-async fn do_dump() -> Result<()> {
+async fn do_list() -> Result<()> {
+    let cfg = config::load().await?;
+    if cfg.folders.is_empty() {
+        println!("no folders");
+        return Ok(());
+    }
+    for (i, f) in cfg.folders.iter().enumerate() {
+        let path = f
+            .path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(no local path)".into());
+        println!("{i}: {path}");
+    }
+    Ok(())
+}
+
+async fn do_remove(folder: PathBuf) -> Result<()> {
+    let mut cfg = config::load().await?;
+    let idx = resolve_folder(&cfg, Some(&folder))?;
+    let removed = cfg.folders.remove(idx);
+    config::save(&cfg).await?;
+    let path = removed
+        .path
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    println!("Stopped syncing: {path}");
+    println!("(local files were left in place)");
+    Ok(())
+}
+
+/// Dump every entry in a folder's doc — keys, tombstones, hashes, authors.
+async fn do_dump(folder: Option<PathBuf>) -> Result<()> {
     init_tracing();
     let mut cfg = config::load().await?;
+    let idx = resolve_folder(&cfg, folder.as_deref())?;
     let node = spawn_node().await?;
-    let doc = open_doc(&node, &mut cfg)
+    let doc = open_doc(&node, &mut cfg.folders[idx])
         .await?
         .context("not paired — nothing to dump")?;
+    config::save(&cfg).await?;
 
     println!("namespace: {}", doc.id());
     let stream = doc
@@ -330,12 +463,33 @@ async fn spawn_node() -> Result<Arc<Node>> {
     Ok(Arc::new(Node::spawn(&iroh_root).await?))
 }
 
-/// Re-open the synced doc on cold start. Tries `open(namespace_id)` first
-/// (cheap, attaches to the local replica); falls back to `import(ticket)` for
-/// the device that's joining for the first time. Persists the namespace id if
-/// the import path discovered it.
-async fn open_doc(node: &Node, cfg: &mut config::Config) -> Result<Option<Doc>> {
-    if let Some(id_str) = &cfg.namespace_id {
+/// Resolve a folder selector to an index into `cfg.folders`. `None` is allowed
+/// only when exactly one folder is synced; otherwise the caller must name one.
+fn resolve_folder(cfg: &config::Config, sel: Option<&Path>) -> Result<usize> {
+    match sel {
+        Some(p) => {
+            let canon = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+            cfg.folders
+                .iter()
+                .position(|f| {
+                    f.path.as_deref() == Some(canon.as_path()) || f.path.as_deref() == Some(p)
+                })
+                .with_context(|| format!("no synced folder at {}", p.display()))
+        }
+        None => match cfg.folders.len() {
+            0 => bail!("no folders — run `syncbox init <folder>` first"),
+            1 => Ok(0),
+            _ => bail!("several folders synced — name one by path (see `syncbox list`)"),
+        },
+    }
+}
+
+/// Re-open a folder's synced doc. Tries `open(namespace_id)` first (cheap,
+/// attaches to the local replica); falls back to `import(ticket)` for the
+/// device joining for the first time. Updates `folder.namespace_id` if the
+/// import path discovered it — the caller is responsible for saving config.
+async fn open_doc(node: &Node, folder: &mut config::FolderConfig) -> Result<Option<Doc>> {
+    if let Some(id_str) = &folder.namespace_id {
         if let Ok(id) = NamespaceId::from_str(id_str) {
             match node.docs.open(id).await {
                 Ok(Some(d)) => return Ok(Some(d)),
@@ -344,15 +498,11 @@ async fn open_doc(node: &Node, cfg: &mut config::Config) -> Result<Option<Doc>> 
             }
         }
     }
-    if let Some(t) = &cfg.doc_ticket {
-        if let Ok(ticket) = DocTicket::from_str(t) {
+    if let Some(t) = folder.doc_ticket.clone() {
+        if let Ok(ticket) = DocTicket::from_str(&t) {
             match node.docs.import(ticket).await {
                 Ok(d) => {
-                    let id_str = d.id().to_string();
-                    if cfg.namespace_id.as_deref() != Some(id_str.as_str()) {
-                        cfg.namespace_id = Some(id_str);
-                        config::save(cfg).await?;
-                    }
+                    folder.namespace_id = Some(d.id().to_string());
                     return Ok(Some(d));
                 }
                 Err(e) => tracing::warn!(error = ?e, "doc import failed"),

@@ -137,7 +137,11 @@ pub fn run() {
                     let inner = state.inner.lock().await;
                     let n = inner.active.load(std::sync::atomic::Ordering::Relaxed);
                     let configured = inner.doc.is_some()
-                        && inner.config.folder.is_some()
+                        && inner
+                            .config
+                            .primary()
+                            .and_then(|f| f.path.as_ref())
+                            .is_some()
                         && inner.sync_handle.is_some();
                     // Recent movement in *either* direction. last_activity_ms
                     // is bumped on every upload and download; the 1200 ms
@@ -388,7 +392,7 @@ async fn bootstrap(app: &AppHandle) -> Result<()> {
     // app), but with no folder picked the user has nothing to click and can't
     // tell syncbox is even running. Surface the window so they can pick a
     // folder and pair. A configured install stays quietly in the tray.
-    if cfg.folder.is_none() {
+    if cfg.primary().and_then(|f| f.path.as_ref()).is_none() {
         if let Some(win) = app.get_webview_window("main") {
             let _ = win.show();
             let _ = win.set_focus();
@@ -417,7 +421,7 @@ async fn bootstrap(app: &AppHandle) -> Result<()> {
         let mut blocked = inner.blocked.lock().await;
         blocked.extend(cfg.blocked_peers.iter().cloned());
     }
-    if let Some(folder) = &cfg.folder {
+    if let Some(folder) = cfg.primary().and_then(|f| f.path.as_ref()) {
         match IgnoreSet::load(folder) {
             Ok(s) => inner.ignores = Some(Arc::new(s)),
             Err(e) => tracing::warn!(error = ?e, "could not load ignore set"),
@@ -429,7 +433,8 @@ async fn bootstrap(app: &AppHandle) -> Result<()> {
     // persisted but do have a ticket, fall through to `import(ticket)` —
     // this is the path on the device that joins for the first time.
     let mut opened: Option<Doc> = None;
-    if let Some(id_str) = &cfg.namespace_id {
+    let cfg_namespace = cfg.primary().and_then(|f| f.namespace_id.clone());
+    if let Some(id_str) = &cfg_namespace {
         if let Ok(id) = NamespaceId::from_str(id_str) {
             match node.docs.open(id).await {
                 Ok(Some(d)) => {
@@ -442,7 +447,8 @@ async fn bootstrap(app: &AppHandle) -> Result<()> {
         }
     }
     if opened.is_none() {
-        if let Some(t) = &cfg.doc_ticket {
+        let cfg_ticket = cfg.primary().and_then(|f| f.doc_ticket.clone());
+        if let Some(t) = &cfg_ticket {
             if let Ok(ticket) = DocTicket::from_str(t) {
                 match node.docs.import(ticket).await {
                     Ok(doc) => opened = Some(doc),
@@ -455,8 +461,9 @@ async fn bootstrap(app: &AppHandle) -> Result<()> {
     }
     if let Some(d) = &opened {
         let id_str = d.id().to_string();
-        if inner.config.namespace_id.as_deref() != Some(id_str.as_str()) {
-            inner.config.namespace_id = Some(id_str);
+        let folder = inner.config.primary_or_default();
+        if folder.namespace_id.as_deref() != Some(id_str.as_str()) {
+            folder.namespace_id = Some(id_str);
             if let Err(e) = config::save(&inner.config).await {
                 tracing::warn!(error = ?e, "save namespace_id failed");
             }
@@ -599,7 +606,7 @@ async fn maybe_start_sync(app: &AppHandle) -> Result<bool> {
     let Some(author) = inner.author else {
         return Ok(false);
     };
-    let Some(folder) = inner.config.folder.clone() else {
+    let Some(folder) = inner.config.primary().and_then(|f| f.path.clone()) else {
         return Ok(false);
     };
     let Some(echo) = inner.echo.clone() else {
@@ -715,16 +722,14 @@ async fn cmd_get_status(state: State<'_, AppState>) -> Result<StatusView, String
         None => None,
     };
     let is_owner = matches!((&owner_id, &self_id), (Some(o), Some(me)) if o == me);
+    let primary = inner.config.primary();
+    let folder_path = primary.and_then(|f| f.path.as_ref());
     Ok(StatusView {
-        folder: inner
-            .config
-            .folder
-            .as_ref()
-            .map(|p| p.display().to_string()),
+        folder: folder_path.map(|p| p.display().to_string()),
         hostname: inner.config.hostname.clone(),
         has_doc: inner.doc.is_some(),
-        has_ticket: inner.config.doc_ticket.is_some(),
-        paired: inner.doc.is_some() && inner.config.folder.is_some(),
+        has_ticket: primary.and_then(|f| f.doc_ticket.as_ref()).is_some(),
+        paired: inner.doc.is_some() && folder_path.is_some(),
         syncing: inner.sync_handle.is_some(),
         peers_online,
         peers_known,
@@ -826,8 +831,9 @@ async fn cmd_get_ticket(
         let ticket = doc.share(mode, opts).await.map_err(|e| e.to_string())?;
         let s = ticket.to_string();
 
-        inner.config.doc_ticket = Some(s.clone());
-        inner.config.namespace_id = Some(doc.id().to_string());
+        let folder = inner.config.primary_or_default();
+        folder.doc_ticket = Some(s.clone());
+        folder.namespace_id = Some(doc.id().to_string());
         // Pairing re-authorizes: clear the stop-syncing list so a device
         // stopped earlier can sync again.
         inner.config.blocked_peers.clear();
@@ -861,8 +867,9 @@ async fn cmd_join_with_ticket(
                 return Err(format!("could not join: {e}"));
             }
         };
-        inner.config.namespace_id = Some(doc.id().to_string());
-        inner.config.doc_ticket = Some(ticket.trim().to_string());
+        let folder = inner.config.primary_or_default();
+        folder.namespace_id = Some(doc.id().to_string());
+        folder.doc_ticket = Some(ticket.trim().to_string());
         inner.doc = Some(doc);
         // Pairing re-authorizes: clear the stop-syncing list so a device
         // stopped earlier can sync again.
@@ -882,7 +889,12 @@ async fn cmd_join_with_ticket(
     if !started {
         // Doc is set but sync didn't start — almost always "no folder yet".
         let inner = state.inner.lock().await;
-        if inner.config.folder.is_none() {
+        if inner
+            .config
+            .primary()
+            .and_then(|f| f.path.as_ref())
+            .is_none()
+        {
             return Err("joined — now choose a folder to sync".into());
         }
     }
@@ -907,7 +919,7 @@ async fn cmd_choose_folder(
         .map_err(|e| format!("path conversion failed: {e}"))?;
     {
         let mut inner = state.inner.lock().await;
-        inner.config.folder = Some(pb.clone());
+        inner.config.primary_or_default().path = Some(pb.clone());
         // Reload .syncboxignore for the new folder.
         match IgnoreSet::load(&pb) {
             Ok(s) => inner.ignores = Some(Arc::new(s)),
@@ -929,7 +941,7 @@ async fn cmd_open_folder(app: AppHandle, _state: State<'_, AppState>) -> Result<
 async fn cmd_open_folder_inner(app: &AppHandle) -> Result<()> {
     let state: State<AppState> = app.state();
     let inner = state.inner.lock().await;
-    let Some(path) = inner.config.folder.clone() else {
+    let Some(path) = inner.config.primary().and_then(|f| f.path.clone()) else {
         return Ok(());
     };
     drop(inner);
@@ -1016,8 +1028,9 @@ async fn cmd_make_code(
         let (mode, opts) = peer::share_opts(read_only.unwrap_or(false));
         let ticket = doc.share(mode, opts).await.map_err(|e| e.to_string())?;
         let s = ticket.to_string();
-        inner.config.namespace_id = Some(doc.id().to_string());
-        inner.config.doc_ticket = Some(s.clone());
+        let folder = inner.config.primary_or_default();
+        folder.namespace_id = Some(doc.id().to_string());
+        folder.doc_ticket = Some(s.clone());
         // Pairing re-authorizes: clear the stop-syncing list so a device
         // stopped earlier can sync again.
         inner.config.blocked_peers.clear();
@@ -1065,8 +1078,8 @@ async fn cmd_get_storage_size(_state: State<'_, AppState>) -> Result<u64, String
     // iroh blob store: that holds a second, content-addressed copy of every
     // blob and would over-report (badly so before GC reclaims orphaned blobs).
     let cfg = config::load().await.map_err(|e| e.to_string())?;
-    match cfg.folder {
-        Some(folder) => Ok(dir_size(&folder)),
+    match cfg.primary().and_then(|f| f.path.as_ref()) {
+        Some(folder) => Ok(dir_size(folder)),
         None => Ok(0),
     }
 }
@@ -1229,7 +1242,7 @@ async fn cmd_get_read_only(state: State<'_, AppState>) -> Result<bool, String> {
 async fn cmd_write_default_ignore(state: State<'_, AppState>) -> Result<bool, String> {
     let folder = {
         let inner = state.inner.lock().await;
-        inner.config.folder.clone()
+        inner.config.primary().and_then(|f| f.path.clone())
     };
     let Some(folder) = folder else {
         return Err("no folder set".into());

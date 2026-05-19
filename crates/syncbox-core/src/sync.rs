@@ -377,7 +377,16 @@ async fn reconnect_peers(state: &SyncState) {
         }
     };
     let mut peers: Vec<EndpointAddr> = cfg.known_peers;
-    if let Some(t) = &cfg.doc_ticket {
+    // Use the ticket of the folder this loop syncs — match by namespace, since
+    // a device may sync several folders, each with its own ticket.
+    let ns = state.doc.id().to_string();
+    let folder_ticket = cfg
+        .folders
+        .iter()
+        .find(|f| f.namespace_id.as_deref() == Some(ns.as_str()))
+        .or_else(|| cfg.folders.first())
+        .and_then(|f| f.doc_ticket.clone());
+    if let Some(t) = &folder_ticket {
         if let Ok(ticket) = DocTicket::from_str(t) {
             for addr in ticket.nodes {
                 if !peers.iter().any(|p| p.id == addr.id) {

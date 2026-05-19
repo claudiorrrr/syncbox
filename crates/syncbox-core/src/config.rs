@@ -5,26 +5,71 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::fs;
 
+/// One synced folder: a local directory mirrored into an iroh-docs namespace.
+///
+/// A device can sync several folders at once; each is one of these. The three
+/// `Option` fields can be unset independently — a folder picked but not yet
+/// paired has a `path` and no namespace; a folder joined from a pairing code
+/// has a namespace and ticket but no `path` until the user places it on disk.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FolderConfig {
+    /// Local directory mirrored across devices. `None` right after joining a
+    /// shared folder whose local location hasn't been chosen yet.
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+    /// The doc ticket for this folder's namespace. Kept around as a fallback
+    /// for re-pairing if the local doc DB is wiped.
+    #[serde(default)]
+    pub doc_ticket: Option<String>,
+    /// The persistent identifier of this folder's synced doc. Lets us re-open
+    /// the existing local replica on restart without going through `import`,
+    /// which fails if the namespace already exists.
+    #[serde(default)]
+    pub namespace_id: Option<String>,
+    /// True if this device joined the folder read-only — it receives changes
+    /// but never propagates its own for this folder.
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+impl FolderConfig {
+    /// A folder entry for a freshly-picked local directory, not yet paired.
+    pub fn for_path(path: PathBuf) -> Self {
+        Self {
+            path: Some(path),
+            ..Default::default()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
-    /// The folder we mirror across devices. None until the user picks one.
-    pub folder: Option<PathBuf>,
-    /// The doc ticket for the namespace we sync into. Kept around as a
-    /// fallback for re-pairing if the local doc DB is wiped.
-    pub doc_ticket: Option<String>,
-    /// The persistent identifier of the synced doc. Lets us re-open the
-    /// existing local replica on restart without going through `import`,
-    /// which fails if the namespace already exists.
-    pub namespace_id: Option<String>,
+    /// The folders this device syncs. Empty until the user picks one. A single
+    /// entry is the common case; the list supports several shared folders.
+    #[serde(default)]
+    pub folders: Vec<FolderConfig>,
+
+    // --- legacy single-folder fields, kept for migration only ---
+    // Pre-multi-folder configs stored one folder at the top level. `load()`
+    // folds these into `folders`; `skip_serializing` means they are never
+    // written back, so a config is migrated in place the first time it loads.
+    #[serde(default, skip_serializing, rename = "folder")]
+    legacy_folder: Option<PathBuf>,
+    #[serde(default, skip_serializing, rename = "doc_ticket")]
+    legacy_doc_ticket: Option<String>,
+    #[serde(default, skip_serializing, rename = "namespace_id")]
+    legacy_namespace_id: Option<String>,
+
     /// The machine's own hostname. Fallback name when `device_name` is unset.
     pub hostname: String,
     /// User-chosen name for this device, shown to paired devices. None → the
     /// `hostname` is used instead. Set in the GUI.
     #[serde(default)]
     pub device_name: Option<String>,
-    /// Full EndpointAddrs of peers we've seen synced with this doc. On
-    /// restart we feed them to `doc.start_sync` so reconnection doesn't
-    /// have to wait for fresh relay/mDNS discovery from scratch.
+    /// Full EndpointAddrs of peers we've seen synced with. On restart we feed
+    /// them to `doc.start_sync` so reconnection doesn't have to wait for fresh
+    /// relay/mDNS discovery from scratch. Device-global: a peer address is the
+    /// same whichever folder it was seen on.
     #[serde(default)]
     pub known_peers: Vec<EndpointAddr>,
     /// URL of the rendezvous worker that swaps short pairing codes for
@@ -75,6 +120,47 @@ impl Config {
             _ => self.hostname.clone(),
         }
     }
+
+    /// The primary (first) synced folder, if any. Single-folder code paths
+    /// operate on this one; multi-folder callers iterate `folders` directly.
+    pub fn primary(&self) -> Option<&FolderConfig> {
+        self.folders.first()
+    }
+
+    /// Mutable primary folder, if one exists.
+    pub fn primary_mut(&mut self) -> Option<&mut FolderConfig> {
+        self.folders.first_mut()
+    }
+
+    /// The primary folder, creating an empty entry if there is none. Used when
+    /// pairing or joining needs somewhere to store a namespace/ticket.
+    pub fn primary_or_default(&mut self) -> &mut FolderConfig {
+        if self.folders.is_empty() {
+            self.folders.push(FolderConfig::default());
+        }
+        &mut self.folders[0]
+    }
+
+    /// Fold a pre-multi-folder config (top-level `folder`/`doc_ticket`/
+    /// `namespace_id`) into the `folders` list. No-op once migrated.
+    fn migrate_legacy_folder(&mut self) {
+        if !self.folders.is_empty() {
+            return;
+        }
+        let (path, ticket, ns) = (
+            self.legacy_folder.take(),
+            self.legacy_doc_ticket.take(),
+            self.legacy_namespace_id.take(),
+        );
+        if path.is_some() || ticket.is_some() || ns.is_some() {
+            self.folders.push(FolderConfig {
+                path,
+                doc_ticket: ticket,
+                namespace_id: ns,
+                read_only: false,
+            });
+        }
+    }
 }
 
 /// Root directory for syncbox's own state — `config.json` plus the iroh blob
@@ -116,6 +202,7 @@ pub async fn load() -> Result<Config> {
     if cfg.hostname.is_empty() {
         cfg.hostname = Config::host();
     }
+    cfg.migrate_legacy_folder();
     Ok(cfg)
 }
 

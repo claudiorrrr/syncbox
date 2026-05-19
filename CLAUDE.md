@@ -18,7 +18,7 @@ bun run tauri build                     # → target/release/bundle/macos/
 
 # CLI
 cargo build --release -p syncbox-cli    # → target/release/syncbox
-cargo run -p syncbox-cli -- status      # any subcommand: init/pair/join/run/status
+cargo run -p syncbox-cli -- status      # init/pair/join/run/status/list/remove
 
 # Tests
 cargo test -p syncbox-core              # syncbox-core currently has none
@@ -98,6 +98,14 @@ GUI Advanced field → compiled-in default. The default is baked from
 Per device under `~/Library/Application Support/dev.syncbox/` — override with
 `SYNCBOX_DATA_DIR` (lets several isolated instances run on one machine for
 testing). `config.json` + `iroh/` (secret key, blob store, docs DB).
+
+`config.json` holds a `folders` list — each `FolderConfig` is one synced
+folder (local `path` + its own doc `namespace_id`/`doc_ticket`). A device can
+sync several; each folder is an independent iroh-docs namespace over the one
+shared `Node`. The CLI's `run` drives a `sync::run` loop per folder; the GUI
+is still single-folder and operates on `folders[0]` via `Config::primary()`.
+`config::load()` migrates pre-0.3.1 single-folder configs (top-level
+`folder`/`doc_ticket`/`namespace_id`) into the list on first load.
 
 ## Gotchas
 
