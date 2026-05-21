@@ -31,3 +31,6 @@ target/
 
 # Icon raster — derived from app-icon.svg, regenerate with `tauri icon`.
 /app-icon.png
+
+# AI assistant guidance — kept local, not tracked.
+CLAUDE.md
