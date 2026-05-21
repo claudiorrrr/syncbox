@@ -1315,13 +1315,11 @@ fn file_id(meta: &std::fs::Metadata) -> u64 {
     meta.ino()
 }
 
-#[cfg(windows)]
-fn file_id(meta: &std::fs::Metadata) -> u64 {
-    use std::os::windows::fs::MetadataExt;
-    meta.file_index().unwrap_or(0)
-}
-
-#[cfg(not(any(unix, windows)))]
+/// Non-Unix platforms have no stable inode equivalent in std (`file_index` is
+/// still unstable on Windows), so the fingerprint relies on size + mtime alone.
+/// A same-path file whose size or mtime changed still misses and re-hashes —
+/// the cache only loses the ability to notice an mtime-preserving swap.
+#[cfg(not(unix))]
 fn file_id(_meta: &std::fs::Metadata) -> u64 {
     0
 }
