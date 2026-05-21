@@ -126,6 +126,13 @@ pub fn run() {
             update_item: std::sync::Mutex::new(None),
         })
         .setup(|app| {
+            // Register the standard app menu so Cmd+C/V/X/A work in webview
+            // inputs. Without an explicit menu, macOS never wires the system
+            // shortcuts to the focused field — paste into the join-code box or
+            // the ticket textarea silently does nothing.
+            let menu = Menu::default(app.handle())?;
+            app.set_menu(menu)?;
+
             build_tray(app.handle().clone())?;
 
             // Hide window on startup — we're a tray app.
@@ -285,8 +292,24 @@ pub fn run() {
             cmd_write_default_ignore,
             cmd_get_transfer_stats,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // Dock-icon click (or any reopen request from macOS) surfaces the
+            // window. The app stays in the tray after the window is closed, so
+            // without this the user has no way to bring it back via the Dock.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = event {
+                if let Some(win) = app.get_webview_window("main") {
+                    let _ = win.show();
+                    let _ = win.set_focus();
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (app, event);
+            }
+        });
 }
 
 /// The three states the menu-bar icon can show.

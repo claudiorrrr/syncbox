@@ -20,8 +20,6 @@ const els = {
   folderTitle: el("folder-title"),
   folderChoice: el("folder-choice"),
   btnChooseFolder: el("btn-choose-folder"),
-  btnFolderEnterCode: el("btn-folder-enter-code"),
-  folderEnterPanel: el("folder-enter-panel"),
   joinCode: el("join-code"),
   btnUseCode: el("btn-use-code"),
   pairResult: el("pair-result"),
@@ -35,6 +33,7 @@ const els = {
   deviceList: el("device-list"),
   noDevices: el("no-devices"),
   btnAddDevice: el("btn-add-device"),
+  btnAddFolderRun: el("btn-add-folder-run"),
 
   adddeviceFolder: el("adddevice-folder"),
   ourCode: el("our-code"),
@@ -88,7 +87,6 @@ let current = 0;
 // 'settings' / 'adddevice' / 'addfolder' when the user navigated there;
 // null = let the folder list decide (setup vs running).
 let viewOverride = null;
-let folderPanel = "choice"; // 'choice' | 'enter' — sub-panel of the folder view
 let lastView = null;
 let lastStatus = null;
 let lastXfer = null;
@@ -120,8 +118,6 @@ function render(s) {
     els.folderStep.hidden = folders.length !== 0;
     els.folderTitle.textContent =
       viewOverride === "addfolder" ? "Sync another folder" : "Sync a folder";
-    els.folderChoice.hidden = folderPanel !== "choice";
-    els.folderEnterPanel.hidden = folderPanel !== "enter";
   }
   if (v === "adddevice") {
     const f = folders[current];
@@ -136,7 +132,6 @@ els.btnSettings.addEventListener("click", () => {
 });
 els.btnBack.addEventListener("click", () => {
   viewOverride = null;
-  folderPanel = "choice";
   render(lastStatus);
 });
 els.btnAddDevice.addEventListener("click", () => {
@@ -145,21 +140,12 @@ els.btnAddDevice.addEventListener("click", () => {
   els.codeExpiry.textContent = "";
   render(lastStatus);
 });
-els.btnAddFolder.addEventListener("click", () => {
+function goAddFolder() {
   viewOverride = "addfolder";
-  folderPanel = "choice";
   render(lastStatus);
-});
-els.btnFolderEnterCode.addEventListener("click", () => {
-  folderPanel = "enter";
-  render(lastStatus);
-});
-document.querySelectorAll(".folder-back").forEach((b) =>
-  b.addEventListener("click", () => {
-    folderPanel = "choice";
-    render(lastStatus);
-  }),
-);
+}
+els.btnAddFolder.addEventListener("click", goAddFolder);
+els.btnAddFolderRun.addEventListener("click", goAddFolder);
 
 els.folderSwitch.addEventListener("change", () => {
   const i = parseInt(els.folderSwitch.value, 10);
@@ -463,7 +449,6 @@ async function pickFolder(idx) {
     if (newIdx === null || newIdx === undefined) return false;
     current = newIdx;
     viewOverride = null;
-    folderPanel = "choice";
     await refresh();
     return true;
   } catch (e) {
@@ -490,7 +475,6 @@ els.btnUseCode.addEventListener("click", async () => {
     } else {
       current = idx;
       viewOverride = null;
-      folderPanel = "choice";
       await refresh();
     }
   } catch (e) {

@@ -307,10 +307,33 @@ button.link.tiny {
   border-color: var(--accent);
 }
 
+/* horizontal "or" divider between the two pairing options on first-run setup */
+.or-sep {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 11px;
+  margin: 8px 0;
+}
+.or-sep::before,
+.or-sep::after {
+  content: "";
+  flex: 1;
+  border-top: 1px solid var(--line);
+}
+
 .row {
   display: flex;
   gap: 8px;
   align-items: center;
+}
+
+.row-actions {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  flex-wrap: wrap;
 }
 
 /* ---------- form fields ---------- */
