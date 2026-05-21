@@ -1259,7 +1259,11 @@ async fn remove_dir_if_empty(dir: &Path) -> bool {
 /// is safe to remove.
 fn is_os_junk(name: &std::ffi::OsStr) -> bool {
     let n = name.to_string_lossy();
-    n == ".DS_Store" || n == ".localized" || n == "Thumbs.db" || n.starts_with("._")
+    n == ".DS_Store"
+        || n == ".localized"
+        || n == "Thumbs.db"
+        || n == "desktop.ini"
+        || n.starts_with("._")
 }
 
 // ---------- helpers ----------
@@ -1291,12 +1295,35 @@ async fn hash_file(path: &Path) -> Result<Hash> {
     Ok(Hash::from_bytes(*hasher.finalize().as_bytes()))
 }
 
-/// Cheap change fingerprint: `(inode, size, mtime-in-nanoseconds)`. A file
-/// edited in place keeps its inode but bumps size and/or mtime.
+/// Cheap change fingerprint: `(file_id, size, mtime-in-nanoseconds)`. A file
+/// edited in place keeps its identifier but bumps size and/or mtime. The
+/// identifier is the inode on Unix and `file_index()` on Windows; anything
+/// else falls back to 0, which only costs a cache miss.
 fn file_fp(meta: &std::fs::Metadata) -> (u64, u64, i128) {
+    let mtime_ns = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as i128)
+        .unwrap_or(0);
+    (file_id(meta), meta.len(), mtime_ns)
+}
+
+#[cfg(unix)]
+fn file_id(meta: &std::fs::Metadata) -> u64 {
     use std::os::unix::fs::MetadataExt;
-    let mtime_ns = meta.mtime() as i128 * 1_000_000_000 + meta.mtime_nsec() as i128;
-    (meta.ino(), meta.len(), mtime_ns)
+    meta.ino()
+}
+
+#[cfg(windows)]
+fn file_id(meta: &std::fs::Metadata) -> u64 {
+    use std::os::windows::fs::MetadataExt;
+    meta.file_index().unwrap_or(0)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_id(_meta: &std::fs::Metadata) -> u64 {
+    0
 }
 
 /// `hash_file`, but reuse the cached hash when the file's fingerprint is

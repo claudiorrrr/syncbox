@@ -114,8 +114,6 @@ impl Node {
 /// bytes in `iroh/secret.key`, owner-readable only. A malformed file is
 /// replaced rather than treated as fatal.
 fn load_or_create_secret_key(iroh_root: &Path) -> Result<SecretKey> {
-    use std::os::unix::fs::PermissionsExt;
-
     let path = iroh_root.join("secret.key");
     if let Ok(bytes) = std::fs::read(&path) {
         match <[u8; 32]>::try_from(bytes.as_slice()) {
@@ -126,8 +124,14 @@ fn load_or_create_secret_key(iroh_root: &Path) -> Result<SecretKey> {
     std::fs::create_dir_all(iroh_root).context("create iroh dir")?;
     let key = SecretKey::generate();
     std::fs::write(&path, key.to_bytes()).context("write secret.key")?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-        .context("chmod secret.key")?;
+    // Unix: lock the key down to owner-only. On Windows, the data dir under
+    // %APPDATA% inherits a user-private ACL, so no extra chmod is needed.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .context("chmod secret.key")?;
+    }
     Ok(key)
 }
 

@@ -17,6 +17,7 @@ pub const BUILTIN: &[&str] = &[
     ".svn/",
     ".DS_Store",
     "Thumbs.db",
+    "desktop.ini",
     "node_modules/",
     "target/",
     ".venv/",

@@ -21,8 +21,10 @@ use syncbox_core::{config, pair, peer, sync};
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    ActivationPolicy, AppHandle, Emitter, Manager, State,
+    AppHandle, Emitter, Manager, State,
 };
+#[cfg(target_os = "macos")]
+use tauri::ActivationPolicy;
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_dialog::DialogExt;
 use tokio::sync::{mpsc, watch, Mutex};
@@ -1314,7 +1316,9 @@ fn cmd_set_update_available(state: State<'_, AppState>, version: Option<String>)
 }
 
 /// Apply the Dock-icon preference. `Accessory` = menu-bar-only, no Dock icon;
-/// `Regular` = normal app with a Dock icon.
+/// `Regular` = normal app with a Dock icon. No-op on non-macOS — the Dock is a
+/// macOS concept, tray-only apps on other platforms simply hide the window.
+#[cfg(target_os = "macos")]
 fn apply_dock_policy(app: &AppHandle, hide: bool) {
     let policy = if hide {
         ActivationPolicy::Accessory
@@ -1325,6 +1329,9 @@ fn apply_dock_policy(app: &AppHandle, hide: bool) {
         tracing::warn!(error = ?e, "set activation policy failed");
     }
 }
+
+#[cfg(not(target_os = "macos"))]
+fn apply_dock_policy(_app: &AppHandle, _hide: bool) {}
 
 #[tauri::command]
 async fn cmd_set_hide_dock_icon(
