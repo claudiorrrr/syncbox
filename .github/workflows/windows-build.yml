@@ -1,12 +1,17 @@
 name: Windows build (experimental)
 
-# Builds an unsigned Windows MSI + CLI binary for syncbox.
+# Builds a Windows MSI + CLI binary for syncbox.
 #
-# Triggered manually via the Actions tab, or on a version tag push. Code
-# signing is not set up yet — the MSI works but Windows SmartScreen will warn
-# on first run. The updater is macOS-only for now (latest.json only carries
-# darwin-aarch64), so Windows installs must update manually until a signed
-# Windows updater channel is added.
+#   * workflow_dispatch  → build only, artifacts attached to the run
+#   * push of a v* tag   → build AND attach the MSI + exe to the GitHub
+#                          release for that tag (created by scripts/release.sh
+#                          for the macOS assets; this just uploads alongside)
+#
+# Signing is optional: if the repo has WINDOWS_PFX_BASE64 + WINDOWS_PFX_PASSWORD
+# secrets, the MSI and exe are Authenticode-signed; otherwise they ship
+# unsigned and Windows SmartScreen warns on first run (More info → Run anyway).
+# The updater is macOS-only for now (latest.json carries darwin-aarch64 only),
+# so Windows installs update by downloading a newer MSI.
 
 on:
   workflow_dispatch:
@@ -14,9 +19,16 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      # Step-level `if:` can't read secrets directly, so fold the presence
+      # check into a plain env var here.
+      HAS_CERT: ${{ secrets.WINDOWS_PFX_BASE64 != '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -31,7 +43,7 @@ jobs:
 
       # The pair-server URL is baked in at build time by syncbox-core/build.rs
       # from pair-server.txt (gitignored). Write a placeholder so the build
-      # produces a runnable binary; users can override at runtime via the
+      # produces a runnable binary; users override at runtime via the
       # SYNCBOX_PAIR_SERVER env var or the Advanced field in the GUI.
       - name: Write pair-server placeholder
         shell: bash
@@ -46,16 +58,48 @@ jobs:
       - name: Build the Tauri app (MSI installer)
         run: bun run tauri build --bundles msi
 
-      - name: Upload MSI installer
+      # --- collect assets under stable names -----------------------------
+      - name: Stage release assets
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/syncbox.exe dist/syncbox-windows-x64.exe
+          cp target/release/bundle/msi/*.msi dist/syncbox-windows-x64.msi
+
+      # --- optional Authenticode signing ---------------------------------
+      - name: Sign assets
+        if: env.HAS_CERT == 'true'
+        shell: pwsh
+        env:
+          PFX_BASE64: ${{ secrets.WINDOWS_PFX_BASE64 }}
+          PFX_PASSWORD: ${{ secrets.WINDOWS_PFX_PASSWORD }}
+        run: |
+          $pfx = "$env:RUNNER_TEMP\cert.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:PFX_BASE64))
+          $signtool = (Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+            Where-Object { $_.FullName -match 'x64' } | Select-Object -Last 1).FullName
+          foreach ($f in Get-ChildItem dist\*) {
+            & $signtool sign /fd SHA256 /f $pfx /p $env:PFX_PASSWORD `
+              /tr http://timestamp.digicert.com /td SHA256 $f.FullName
+          }
+
+      # --- workflow_dispatch: keep artifacts on the run ------------------
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: syncbox-windows-msi
-          path: target/release/bundle/msi/*.msi
+          name: syncbox-windows
+          path: dist/*
           if-no-files-found: error
 
-      - name: Upload CLI binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: syncbox-cli-windows
-          path: target/release/syncbox.exe
-          if-no-files-found: error
+      # --- tag build: attach to the GitHub release -----------------------
+      - name: Attach to GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # The macOS release.sh may not have created the release yet; create
+          # it if missing, then upload (clobbering on re-run).
+          gh release view "$TAG" || gh release create "$TAG" --title "syncbox $TAG" --generate-notes
+          gh release upload "$TAG" --clobber dist/syncbox-windows-x64.msi dist/syncbox-windows-x64.exe
