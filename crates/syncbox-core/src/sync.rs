@@ -730,11 +730,14 @@ async fn upload_file(state: &SyncState, path: &Path, from_scan: bool) -> Result<
 
     let _busy = ActiveGuard::new(&state.active);
     // import_file streams the file into the blob store and sets the doc
-    // entry in one step. ImportMode::Copy (never TryReference): the blob
-    // store must own its bytes, since this file stays live and mutable.
+    // entry in one step. TryReference avoids duplicating file content on
+    // disk — iroh-blobs hardlinks or reflinks the original file instead of
+    // copying it. If the user edits the file later the watcher detects the
+    // change, re-hashes it, and re-imports (new hash, new reference), so
+    // stale content is never served.
     let outcome = state
         .doc
-        .import_file(&state.node.store, state.author, key, path, ImportMode::Copy)
+        .import_file(&state.node.store, state.author, key, path, ImportMode::TryReference)
         .await
         .context("import_file into doc")?
         .await
