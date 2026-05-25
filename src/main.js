@@ -20,6 +20,7 @@ const els = {
   folderTitle: el("folder-title"),
   folderChoice: el("folder-choice"),
   btnChooseFolder: el("btn-choose-folder"),
+  btnShowJoin: el("btn-show-join"),
   joinCode: el("join-code"),
   btnUseCode: el("btn-use-code"),
   pairResult: el("pair-result"),
@@ -74,6 +75,7 @@ function formatBytes(n) {
 
 const views = {
   folder: el("view-folder"),
+  join: el("view-join"),
   running: el("view-running"),
   adddevice: el("view-adddevice"),
   settings: el("view-settings"),
@@ -94,6 +96,7 @@ let lastXfer = null;
 function pickView(s) {
   if (viewOverride === "settings") return "settings";
   if (viewOverride === "addfolder") return "folder";
+  if (viewOverride === "join") return "join";
   if (viewOverride === "adddevice") return "adddevice";
   if (folders.length === 0) return "folder";
   return "running";
@@ -110,6 +113,7 @@ function render(s) {
   const showBack =
     v === "settings" ||
     v === "adddevice" ||
+    v === "join" ||
     (v === "folder" && viewOverride === "addfolder");
   els.btnBack.classList.toggle("invisible", !showBack);
 
@@ -131,7 +135,9 @@ els.btnSettings.addEventListener("click", () => {
   render(lastStatus);
 });
 els.btnBack.addEventListener("click", () => {
-  viewOverride = null;
+  // From "Join" pop back to the choice screen, not all the way out — the
+  // user opened Join from there, not from running.
+  viewOverride = viewOverride === "join" ? "addfolder" : null;
   render(lastStatus);
 });
 els.btnAddDevice.addEventListener("click", () => {
@@ -458,6 +464,14 @@ async function pickFolder(idx) {
 }
 
 els.btnChooseFolder.addEventListener("click", () => pickFolder(null));
+
+els.btnShowJoin.addEventListener("click", () => {
+  viewOverride = "join";
+  els.joinCode.value = "";
+  showPairResult(els.pairResult, true, "");
+  render(lastStatus);
+  els.joinCode.focus();
+});
 
 els.btnUseCode.addEventListener("click", async () => {
   const code = els.joinCode.value.trim();

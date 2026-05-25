@@ -27,17 +27,29 @@
         <div id="folder-choice">
           <p class="muted">Keep a folder in sync across your Macs.</p>
           <button id="btn-choose-folder" class="choice">
-            <strong>Choose a folder on this Mac</strong>
-            <span class="muted small">Start sharing a folder you already have</span>
+            <strong>Share a folder from this Mac</strong>
+            <span class="muted small">Pick a folder here and share it with your other devices</span>
           </button>
-          <div class="or-sep"><span>or</span></div>
-          <label class="block">
-            <span>Have a code from another Mac?</span>
-            <input id="join-code" type="text" maxlength="7" placeholder="ABC-123" autocapitalize="characters" />
-          </label>
-          <button id="btn-use-code">Connect</button>
-          <p id="pair-result" class="pair-result"></p>
+          <button id="btn-show-join" class="choice">
+            <strong>Join a folder from another device</strong>
+            <span class="muted small">Paste a 6-character code from your other Mac</span>
+          </button>
         </div>
+      </section>
+
+      <!-- ===== JOIN A FOLDER — paste a code ===== -->
+      <section id="view-join" class="view" hidden>
+        <h2>Join a folder</h2>
+        <p class="muted">
+          Open syncbox on your other Mac, click <em>+ Add a device</em>, and
+          paste the code it shows here within 5 minutes.
+        </p>
+        <label class="block">
+          <span>Code from your other Mac</span>
+          <input id="join-code" type="text" maxlength="7" placeholder="ABC-123" autocapitalize="characters" />
+        </label>
+        <button id="btn-use-code">Connect</button>
+        <p id="pair-result" class="pair-result"></p>
       </section>
 
       <!-- ===== RUNNING ===== -->

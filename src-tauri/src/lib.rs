@@ -8,7 +8,7 @@ use iroh_docs::{api::Doc, AuthorId, DocTicket, NamespaceId};
 use serde::Serialize;
 use std::{
     collections::HashSet,
-    path::PathBuf,
+    path::{Path, PathBuf},
     str::FromStr,
     sync::{atomic::AtomicU32, Arc},
 };
@@ -786,6 +786,32 @@ struct FolderView {
     online_peers: usize,
 }
 
+/// Returns the existing synced path that overlaps `candidate`, if any. Two
+/// folders overlap when one is an ancestor of (or equal to) the other —
+/// running two watchers over the same files makes them fight each other.
+/// `skip_idx` excludes the folder being edited so setting a path doesn't
+/// flag itself.
+fn overlapping_folder(
+    existing: &[config::FolderConfig],
+    candidate: &Path,
+    skip_idx: Option<usize>,
+) -> Option<PathBuf> {
+    let cand = std::fs::canonicalize(candidate).unwrap_or_else(|_| candidate.to_path_buf());
+    for (i, fc) in existing.iter().enumerate() {
+        if Some(i) == skip_idx {
+            continue;
+        }
+        let Some(p) = fc.path.as_ref() else {
+            continue;
+        };
+        let ep = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+        if cand == ep || cand.starts_with(&ep) || ep.starts_with(&cand) {
+            return Some(ep);
+        }
+    }
+    None
+}
+
 /// The folder's basename for display, or a placeholder when it has no path.
 fn folder_display_name(path: Option<&PathBuf>) -> String {
     match path {
@@ -1067,6 +1093,15 @@ async fn cmd_pick_folder(
 
     let target = {
         let mut inner = state.inner.lock().await;
+        // Reject overlap with any other synced folder — nested or parent —
+        // because two overlapping watchers fight over the same files.
+        if let Some(conflict) = overlapping_folder(&inner.config.folders, &pb, idx) {
+            return Err(format!(
+                "Can't sync {} because it overlaps with an already-synced folder ({}). Pick a folder outside the existing one.",
+                pb.display(),
+                conflict.display(),
+            ));
+        }
         let target = match idx {
             Some(i) if i < inner.config.folders.len() => {
                 inner.config.folders[i].path = Some(pb.clone());

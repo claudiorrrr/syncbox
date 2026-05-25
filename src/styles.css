@@ -284,6 +284,14 @@ button.link.tiny {
   font-size: 11px;
 }
 
+/* Two stacked choice buttons on the add-folder screen need their own gap;
+ * the surrounding .view's flex-gap doesn't reach inside #folder-choice. */
+#folder-choice {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
 /* big two-line pick-one buttons in the add-device view */
 .choice {
   display: flex;
