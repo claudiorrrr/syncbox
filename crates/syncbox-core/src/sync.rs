@@ -144,16 +144,45 @@ pub struct FpEntry {
 
 const LOG_CAP: usize = 200;
 
-/// Append a timestamped line to the debug log.
+/// Append a timestamped line to the debug log. Times are local — UTC stamps
+/// were too confusing when the user is reading the log and comparing it to
+/// a wall clock.
 pub async fn log_line(log: &LogHandle, msg: impl AsRef<str>) {
-    let secs = now_unix();
-    let (h, m, s) = ((secs / 3600) % 24, (secs / 60) % 60, secs % 60);
+    let secs = (now_unix() as i64).saturating_add(local_offset_secs() as i64);
+    // Modulo a day, treating negative results (pre-epoch local times) as 0.
+    let day = secs.rem_euclid(86_400);
+    let (h, m, s) = ((day / 3600) % 24, (day / 60) % 60, day % 60);
     let line = format!("{h:02}:{m:02}:{s:02}  {}", msg.as_ref());
     let mut buf = log.lock().await;
     buf.push_back(line);
     while buf.len() > LOG_CAP {
         buf.pop_front();
     }
+}
+
+/// Seconds east of UTC for this machine, resolved once and cached. macOS and
+/// Linux use libc::localtime_r — cheap and matches the OS clock the user sees
+/// in their menu bar. On Windows we fall back to 0 (UTC); a real fix needs
+/// the WinAPI TIME_ZONE_INFORMATION path and Windows support is still
+/// experimental.
+#[cfg(unix)]
+fn local_offset_secs() -> i32 {
+    use std::sync::OnceLock;
+    static OFFSET: OnceLock<i32> = OnceLock::new();
+    *OFFSET.get_or_init(|| unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&now, &mut tm).is_null() {
+            0
+        } else {
+            tm.tm_gmtoff as i32
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn local_offset_secs() -> i32 {
+    0
 }
 
 #[derive(Clone)]
@@ -193,19 +222,30 @@ pub struct SyncState {
     pub fp_cache: FpCache,
 }
 
-/// Update the one-line status *and* append it to the debug log.
+/// Update the one-line status *and* append it to the debug log. The log
+/// line is prefixed with the folder's basename so a multi-folder install
+/// can tell which folder fired which event (the log is device-wide).
 async fn set_status(state: &SyncState, msg: impl Into<String>) {
     let msg = msg.into();
-    tracing::info!(status = %msg, "sync status");
+    tracing::info!(folder = %state.root.display(), status = %msg, "sync status");
     *state.status.lock().await = msg.clone();
-    log_line(&state.log, msg).await;
+    log_line(&state.log, format!("[{}] {}", folder_tag(&state.root), msg)).await;
 }
 
 /// Append to the debug log only (used for detail/errors that shouldn't
-/// replace the headline status).
+/// replace the headline status). Also folder-tagged.
 async fn note(state: &SyncState, msg: impl AsRef<str>) {
-    tracing::debug!(note = %msg.as_ref());
-    log_line(&state.log, msg).await;
+    let msg = msg.as_ref();
+    tracing::debug!(folder = %state.root.display(), note = %msg);
+    log_line(&state.log, format!("[{}] {}", folder_tag(&state.root), msg)).await;
+}
+
+/// Short tag for log lines — the folder's basename, or the full path when
+/// the basename can't be extracted (root, weird unicode).
+fn folder_tag(root: &Path) -> String {
+    root.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| root.display().to_string())
 }
 
 pub async fn run(state: SyncState, shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
