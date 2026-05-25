@@ -226,7 +226,7 @@ function updateHero(s, xfer) {
     icon = "◌";
     cls = "warn";
     line = "No devices yet";
-    sub = "Add a device to start syncing this folder.";
+    sub = "Invite a device to start syncing this folder.";
   } else if (dl > 0) {
     icon = "↻";
     cls = "sync";
