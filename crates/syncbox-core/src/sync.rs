@@ -222,6 +222,13 @@ pub async fn run(state: SyncState, shutdown: tokio::sync::watch::Receiver<bool>)
         .await
         .context("subscribe to doc events")?;
 
+    // Kick off the first connection right away. Without this, a folder
+    // joined at runtime had to wait for the 30 s sweep before it dialed
+    // anyone — the device-global known_peers list bootstrap uses doesn't
+    // include the just-joined folder's ticket nodes, so the join sat idle
+    // until the safety-net sweep finally pulled them in.
+    reconnect_peers(&state).await;
+
     // Pull whatever the doc already knows onto disk, and push whatever is on
     // disk into the doc. Either direction may already be partly done.
     if let Err(e) = reconcile_remote(&state).await {
