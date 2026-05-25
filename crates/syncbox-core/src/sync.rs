@@ -256,11 +256,35 @@ pub async fn run(state: SyncState, shutdown: tokio::sync::watch::Receiver<bool>)
     // peers as soon as the doc is open; if we subscribed later we would miss
     // the InsertRemote / ContentReady events for everything that synced in
     // the gap, and those files would silently never land on disk.
-    let mut events = state
+    let events = state
         .doc
         .subscribe()
         .await
         .context("subscribe to doc events")?;
+
+    // iroh-docs backs its subscription with a bounded(256) channel. When the
+    // main loop is busy (initial reconcile, local scan, sweep) it can't poll
+    // `events.next()`, so the channel fills up and **backpressures the entire
+    // iroh sync engine**, stalling blob downloads and peer state updates.
+    // For large folders (thousands of files) this makes the initial sync hang
+    // indefinitely: blobs never finish downloading, the peer is never marked
+    // online, and the joining device ends up empty.
+    //
+    // Fix: a lightweight forwarding task drains the bounded iroh channel into
+    // an unbounded tokio mpsc as fast as events arrive. The iroh engine never
+    // blocks, no matter how long our reconcile or scan takes.
+    let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<LiveEvent>();
+    tokio::spawn({
+        let mut events = events;
+        async move {
+            while let Some(ev) = events.next().await {
+                let Ok(ev) = ev else { continue };
+                if ev_tx.send(ev).is_err() {
+                    break; // receiver dropped — sync loop exited
+                }
+            }
+        }
+    });
 
     // Kick off the first connection right away. Without this, a folder
     // joined at runtime had to wait for the 30 s sweep before it dialed
@@ -323,8 +347,7 @@ pub async fn run(state: SyncState, shutdown: tokio::sync::watch::Receiver<bool>)
                 }
             }
 
-            Some(ev) = events.next() => {
-                let Ok(ev) = ev else { continue };
+            Some(ev) = ev_rx.recv() => {
                 if handle_event(&state, ev).await {
                     // A content event landed — schedule a debounced reconcile.
                     reconcile_at = Some(

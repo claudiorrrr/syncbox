@@ -6182,7 +6182,7 @@ dependencies = [
 
 [[package]]
 name = "syncbox"
-version = "0.4.7"
+version = "0.4.8"
 dependencies = [
  "anyhow",
  "iroh",
@@ -6205,7 +6205,7 @@ dependencies = [
 
 [[package]]
 name = "syncbox-cli"
-version = "0.4.7"
+version = "0.4.8"
 dependencies = [
  "anyhow",
  "clap",
@@ -6220,7 +6220,7 @@ dependencies = [
 
 [[package]]
 name = "syncbox-core"
-version = "0.4.7"
+version = "0.4.8"
 dependencies = [
  "anyhow",
  "blake3",
