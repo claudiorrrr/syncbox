@@ -292,6 +292,7 @@ async fn run_sync() -> Result<()> {
             log: Arc::new(Mutex::new(Default::default())),
             names: Arc::new(Mutex::new(HashMap::new())),
             fp_cache: Default::default(),
+            reconcile_notify: Arc::new(tokio::sync::Notify::new()),
         };
         let (tx, rx) = watch::channel(false);
         shutdowns.push(tx);

@@ -4,8 +4,8 @@
 //!
 //! * The user picks one folder. Its absolute path is the *root*.
 //! * Each file is one doc entry: `key = relative/path`, content addressed
-//!   by iroh-blobs. iroh-docs syncs the entry *and* downloads its content
-//!   to every peer automatically — we never run the blob downloader.
+//!   by iroh-blobs. iroh-docs syncs entries; we drive blob downloads via the
+//!   Downloader API to handle restarts where iroh doesn't re-queue them.
 //! * Local edits → `doc.import_file`; remote edits land via `ContentReady`
 //!   and we mirror the doc onto disk. Content is streamed both ways, so
 //!   memory use stays constant regardless of file size.
@@ -19,7 +19,7 @@ use crate::{config, ignore_patterns::IgnoreSet, peer::Node};
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use futures_lite::StreamExt;
-use iroh::EndpointAddr;
+use iroh::{EndpointAddr, PublicKey};
 use iroh_blobs::{
     api::blobs::{ExportMode, ImportMode},
     Hash,
@@ -220,6 +220,9 @@ pub struct SyncState {
     /// Per-path content-hash cache; lets the startup scan and the 30s sweep
     /// skip re-hashing files unchanged since the last pass.
     pub fp_cache: FpCache,
+    /// Fired by the blob re-download task when downloads complete so the main
+    /// loop runs reconcile without waiting for the 30s sweep.
+    pub reconcile_notify: Arc<tokio::sync::Notify>,
 }
 
 /// Update the one-line status *and* append it to the debug log. The log
@@ -360,6 +363,12 @@ pub async fn run(state: SyncState, shutdown: tokio::sync::watch::Receiver<bool>)
                 reconcile_at = None;
                 if let Err(e) = reconcile_remote(&state).await {
                     tracing::warn!(error = ?e, "reconcile failed");
+                }
+            }
+
+            _ = state.reconcile_notify.notified() => {
+                if let Err(e) = reconcile_remote(&state).await {
+                    tracing::warn!(error = ?e, "reconcile after blob download failed");
                 }
             }
 
@@ -981,6 +990,7 @@ async fn reconcile_remote(state: &SyncState) -> Result<()> {
     tokio::pin!(stream);
 
     let mut wrote = 0u32;
+    let mut need_download: Vec<Hash> = Vec::new();
     while let Some(entry) = stream.next().await {
         let entry = match entry {
             Ok(e) => e,
@@ -1005,6 +1015,21 @@ async fn reconcile_remote(state: &SyncState) -> Result<()> {
             }
             continue;
         }
+        // Track blobs that aren't local yet so we can re-trigger downloads
+        // below. iroh-docs only queues downloads on InsertRemote, so after a
+        // restart blobs that never completed are silently skipped forever
+        // without this.
+        let hash = entry.content_hash();
+        if !state
+            .node
+            .store
+            .blobs()
+            .has(hash)
+            .await
+            .unwrap_or(false)
+        {
+            need_download.push(hash);
+        }
         match write_entry_to_disk(state, &entry).await {
             Ok(true) => wrote += 1,
             Ok(false) => {}
@@ -1014,6 +1039,39 @@ async fn reconcile_remote(state: &SyncState) -> Result<()> {
     if wrote > 0 {
         set_status(state, format!("received {wrote} file(s)")).await;
     }
+
+    // Re-trigger downloads for blobs that are in the doc but not yet local.
+    // This handles restarts: iroh-docs doesn't re-queue downloads for entries
+    // it already holds locally, so without this, files stall until the peer
+    // sends a new InsertRemote event.
+    if !need_download.is_empty() {
+        let peers: Vec<PublicKey> = state
+            .peers
+            .lock()
+            .await
+            .keys()
+            .filter_map(|k| k.parse().ok())
+            .collect();
+        if !peers.is_empty() {
+            tracing::debug!(
+                blobs = need_download.len(),
+                "re-triggering blob downloads after restart"
+            );
+            let downloader = state.node.store.downloader(&state.node.endpoint);
+            let notify = state.reconcile_notify.clone();
+            tokio::spawn(async move {
+                for hash in need_download {
+                    if let Err(e) = downloader.download(hash, peers.clone()).await {
+                        tracing::warn!(error = ?e, "blob re-download failed");
+                    }
+                }
+                // Signal the main loop to run reconcile now that blobs may be
+                // present — avoids calling reconcile_remote here (non-Send).
+                notify.notify_one();
+            });
+        }
+    }
+
     Ok(())
 }
 

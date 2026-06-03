@@ -736,6 +736,7 @@ async fn maybe_start_folder(app: &AppHandle, idx: usize) -> Result<bool> {
         log,
         names,
         fp_cache: Default::default(),
+        reconcile_notify: Arc::new(tokio::sync::Notify::new()),
     };
     let handle = tauri::async_runtime::spawn(async move {
         if let Err(e) = sync::run(st, rx).await {
