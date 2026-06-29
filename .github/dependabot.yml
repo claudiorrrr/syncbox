@@ -1,0 +1,30 @@
+# Dependabot — watches for dependency updates and opens PRs.
+# https://docs.github.com/code-security/dependabot/dependabot-version-updates
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: deps
+    groups:
+      # The iroh stack is a coordinated set — iroh-docs pins compatible
+      # iroh-blobs/iroh-gossip/iroh versions. Bumping one alone breaks the
+      # build, so group all four into a single PR that moves them together.
+      iroh:
+        patterns:
+          - "iroh"
+          - "iroh-*"
+    # iroh crates ship breaking API changes between minor versions; review
+    # these PRs by hand rather than auto-merging.
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: ci

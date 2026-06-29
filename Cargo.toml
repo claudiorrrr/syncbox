@@ -9,16 +9,16 @@ resolver = "2"
 members = ["crates/syncbox-core", "crates/syncbox-cli", "src-tauri"]
 
 [workspace.package]
-version = "0.4.10"
+version = "0.4.11"
 edition = "2021"
 rust-version = "1.77"
 
 [workspace.dependencies]
-# iroh stack — pinned to a compatible pre-release set
-iroh = "=1.0.0-rc.0"
-iroh-blobs = "0.101"
-iroh-docs = "0.99"
-iroh-gossip = "0.99"
+# iroh stack — pinned to a compatible set (iroh 1.0 stable)
+iroh = "1.0"
+iroh-blobs = "0.103"
+iroh-docs = "0.101"
+iroh-gossip = "0.101"
 
 # filesystem watching
 notify = "8"
