@@ -738,15 +738,18 @@ async fn upload_file(state: &SyncState, path: &Path, from_scan: bool) -> Result<
     }
 
     let _busy = ActiveGuard::new(&state.active);
-    // import_file streams the file into the blob store and sets the doc
-    // entry in one step. TryReference avoids duplicating file content on
-    // disk — iroh-blobs hardlinks or reflinks the original file instead of
-    // copying it. If the user edits the file later the watcher detects the
-    // change, re-hashes it, and re-imports (new hash, new reference), so
-    // stale content is never served.
+    // import_file streams the file into the blob store and sets the doc entry
+    // in one step. Copy, not TryReference: TryReference makes the store record
+    // a *path* into the synced folder rather than owning the bytes, so anything
+    // that moves or deletes the file behind our back (an external tool, or any
+    // change made while syncbox is down, so the watcher never sees it) leaves a
+    // blob whose `has()` says present but whose data is gone — export then
+    // fails with NotFound forever. An in-place edit is worse: the blob silently
+    // serves bytes that no longer match its hash. Copy costs a second copy of
+    // the folder on disk and buys a store that can't be corrupted from outside.
     let outcome = state
         .doc
-        .import_file(&state.node.store, state.author, key, path, ImportMode::TryReference)
+        .import_file(&state.node.store, state.author, key, path, ImportMode::Copy)
         .await
         .context("import_file into doc")?
         .await
@@ -990,6 +993,7 @@ async fn reconcile_remote(state: &SyncState) -> Result<()> {
     tokio::pin!(stream);
 
     let mut wrote = 0u32;
+    let mut data_missing = 0u32;
     let mut need_download: Vec<Hash> = Vec::new();
     while let Some(entry) = stream.next().await {
         let entry = match entry {
@@ -1015,35 +1019,34 @@ async fn reconcile_remote(state: &SyncState) -> Result<()> {
             }
             continue;
         }
-        // Track blobs that aren't local yet so we can re-trigger downloads
-        // below. iroh-docs only queues downloads on InsertRemote, so after a
-        // restart blobs that never completed are silently skipped forever
-        // without this.
-        let hash = entry.content_hash();
-        if !state
-            .node
-            .store
-            .blobs()
-            .has(hash)
-            .await
-            .unwrap_or(false)
-        {
-            need_download.push(hash);
-        }
         match write_entry_to_disk(state, &entry).await {
-            Ok(true) => wrote += 1,
-            Ok(false) => {}
+            Ok(WriteOutcome::Wrote) => wrote += 1,
+            Ok(WriteOutcome::Skipped) => {}
+            Ok(WriteOutcome::NeedsDownload) => need_download.push(entry.content_hash()),
+            // Unrecoverable on this device — see WriteOutcome::DataMissing.
+            // Counted, not logged per entry: there is one of these for every
+            // affected file on every pass, and no action the loop can take.
+            Ok(WriteOutcome::DataMissing) => data_missing += 1,
             Err(e) => tracing::warn!(error = ?e, "reconcile write failed"),
         }
     }
     if wrote > 0 {
         set_status(state, format!("received {wrote} file(s)")).await;
     }
+    if data_missing > 0 {
+        tracing::warn!(
+            files = data_missing,
+            "blob data missing from the store — these files cannot be restored \
+             on this device; re-pair the folder against a peer that still has them"
+        );
+    }
 
     // Re-trigger downloads for blobs that are in the doc but not yet local.
     // This handles restarts: iroh-docs doesn't re-queue downloads for entries
     // it already holds locally, so without this, files stall until the peer
-    // sends a new InsertRemote event.
+    // sends a new InsertRemote event. Only NeedsDownload blobs reach here — a
+    // blob the store wrongly believes it has would short-circuit the fetch and
+    // livelock against the reconcile this notifies.
     if !need_download.is_empty() {
         let peers: Vec<PublicKey> = state
             .peers
@@ -1194,20 +1197,53 @@ async fn record_device_name(state: &SyncState, entry: &Entry) {
     }
 }
 
-/// Write one doc entry to disk. Returns Ok(true) if a file was written,
-/// Ok(false) if nothing needed doing (content not local yet, or disk already
-/// matches). The blob is streamed to disk, so memory use is constant
-/// regardless of file size.
-async fn write_entry_to_disk(state: &SyncState, entry: &Entry) -> Result<bool> {
+/// Outcome of mirroring one doc entry to disk.
+enum WriteOutcome {
+    /// A file was written.
+    Wrote,
+    /// Nothing to do: ignored, disk already matches, or the local copy is newer.
+    Skipped,
+    /// The blob isn't local yet. The caller re-triggers a download: iroh-docs
+    /// only queues one on InsertRemote, so after a restart a blob that never
+    /// finished is otherwise skipped forever.
+    NeedsDownload,
+    /// The store says it holds this blob but its data is gone — a dangling
+    /// reference left by a pre-0.4.12 `ImportMode::TryReference` import whose
+    /// source file was moved or deleted outside syncbox.
+    ///
+    /// Deliberately *not* re-downloaded. The downloader consults the same index
+    /// that lies here (`local.is_complete()` short-circuits the fetch), so a
+    /// download would return Ok without transferring anything, and the reconcile
+    /// it notifies on completion would land right back here — a livelock.
+    /// iroh-blobs 0.103 exposes no way to evict a blob (`DeleteBlobs` is
+    /// GC-internal), so this device simply cannot recover the bytes; only
+    /// re-pairing the folder against a peer that still has them will.
+    DataMissing,
+}
+
+/// True if any cause in the chain is a "not found" I/O error. iroh-blobs
+/// surfaces a missing blob data file as `io::Error(NotFound)` deep in the
+/// error chain, which `export_file` then propagates.
+fn is_missing_data(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
+/// Write one doc entry to disk. The blob is streamed to disk, so memory use is
+/// constant regardless of file size. See [`WriteOutcome`] for the return.
+async fn write_entry_to_disk(state: &SyncState, entry: &Entry) -> Result<WriteOutcome> {
     let rel = key_to_rel(entry.key())?;
     if should_skip(&rel, &state.ignores, false) {
-        return Ok(false);
+        return Ok(WriteOutcome::Skipped);
     }
     let abs = state.root.join(&rel);
     let content_hash = entry.content_hash();
 
-    // Content must already be local. iroh-docs downloads it on its own; if
-    // it isn't here yet, bail and let a later ContentReady retry.
+    // Content must already be local. iroh-docs downloads it on its own; if it
+    // isn't here yet, report it so the caller re-triggers a download.
     if !state
         .node
         .store
@@ -1216,14 +1252,14 @@ async fn write_entry_to_disk(state: &SyncState, entry: &Entry) -> Result<bool> {
         .await
         .unwrap_or(false)
     {
-        return Ok(false);
+        return Ok(WriteOutcome::NeedsDownload);
     }
 
     // Disk already matches the doc? Nothing to do. Hashed with constant
     // memory; errors (e.g. file missing) just fall through to the write.
     if let Ok(local) = hash_file_cached(state, &abs).await {
         if local == content_hash {
-            return Ok(false);
+            return Ok(WriteOutcome::Skipped);
         }
     }
 
@@ -1240,25 +1276,40 @@ async fn write_entry_to_disk(state: &SyncState, entry: &Entry) -> Result<bool> {
     };
     if let Some(local_ms) = local_mtime {
         if local_ms > entry_ms {
-            return Ok(false);
+            return Ok(WriteOutcome::Skipped);
         }
     }
     let write_to = abs.clone();
 
+    // Create the destination dir up front and fail loudly if we can't — that
+    // way a NotFound from export_file below is unambiguously the source blob's
+    // missing data, not a missing destination directory.
     if let Some(parent) = write_to.parent() {
-        tokio::fs::create_dir_all(parent).await.ok();
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("create parent dir {}", parent.display()))?;
     }
     // Atomic write: stream the blob into a temp file, then rename. Clear any
     // stale temp file left by a previous interrupted write first.
     let tmp = with_partial_ext(&write_to);
     tokio::fs::remove_file(&tmp).await.ok();
-    let size = state
-        .doc
-        .export_file(&state.node.store, entry.clone(), &tmp, ExportMode::Copy)
-        .await
-        .context("export_file from doc")?
-        .await
-        .context("export_file from doc")?;
+    let export = async {
+        let progress = state
+            .doc
+            .export_file(&state.node.store, entry.clone(), &tmp, ExportMode::Copy)
+            .await
+            .context("export_file from doc")?;
+        progress.await.context("export_file from doc")
+    }
+    .await;
+    let size = match export {
+        Ok(size) => size,
+        // has() said the blob was present but export hit NotFound: its data is
+        // gone. The parent dir was created above, so the NotFound is the source
+        // blob's, not the destination's.
+        Err(e) if is_missing_data(&e) => return Ok(WriteOutcome::DataMissing),
+        Err(e) => return Err(e),
+    };
     tokio::fs::rename(&tmp, &write_to)
         .await
         .context("rename temp")?;
@@ -1285,7 +1336,7 @@ async fn write_entry_to_disk(state: &SyncState, entry: &Entry) -> Result<bool> {
         s.last_activity_ms = now;
     }
     tracing::info!(path = %write_to.display(), "wrote remote file");
-    Ok(true)
+    Ok(WriteOutcome::Wrote)
 }
 
 /// React to a tombstone: a delete on one device removes the file everywhere.
