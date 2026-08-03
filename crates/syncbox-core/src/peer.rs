@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use iroh::{endpoint::presets, protocol::Router, Endpoint, SecretKey};
 use iroh_blobs::{
+    api::downloader::Downloader,
     store::{
         fs::{options::Options, FsStore},
         GcConfig,
@@ -37,6 +38,18 @@ pub struct Node {
     // Held so the gossip protocol stays registered on the router.
     #[allow(dead_code)]
     pub gossip: Gossip,
+    /// The one blob downloader for this process, shared by every folder's
+    /// sync loop.
+    ///
+    /// Built once, deliberately. `Store::downloader()` is not a cheap
+    /// accessor — each call spawns a `DownloaderActor` task *and* a
+    /// `ConnectionPool` with its own actor task, and iroh-blobs says so
+    /// outright: "this creates an object that has internal state, so don't
+    /// create it ad hoc but store it somewhere if you need it multiple
+    /// times". `reconcile_remote` used to build one per pass, and a pass can
+    /// run several times a second, so unreachable peers left an unbounded
+    /// pile of downloader + connection-pool actors that never wound down.
+    pub downloader: Downloader,
 }
 
 impl Node {
@@ -91,12 +104,15 @@ impl Node {
             .accept(iroh_docs::ALPN, docs.clone())
             .spawn();
 
+        let downloader = store.downloader(&endpoint);
+
         Ok(Self {
             endpoint,
             router,
             store,
             docs,
             gossip,
+            downloader,
         })
     }
 

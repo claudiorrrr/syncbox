@@ -223,6 +223,12 @@ pub struct SyncState {
     /// Fired by the blob re-download task when downloads complete so the main
     /// loop runs reconcile without waiting for the 30s sweep.
     pub reconcile_notify: Arc<tokio::sync::Notify>,
+    /// Set while a blob re-download task is running, so `reconcile_remote`
+    /// never starts a second one on top of it. Reconcile is driven by the 30s
+    /// sweep *and* by doc events, and a download against an unreachable peer
+    /// can outlive many of both; without this guard every pass piled another
+    /// full set of downloads onto the ones already stalled.
+    pub dl_inflight: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Update the one-line status *and* append it to the debug log. The log
@@ -1047,6 +1053,16 @@ async fn reconcile_remote(state: &SyncState) -> Result<()> {
     // sends a new InsertRemote event. Only NeedsDownload blobs reach here — a
     // blob the store wrongly believes it has would short-circuit the fetch and
     // livelock against the reconcile this notifies.
+    //
+    // Two things keep this bounded. Only one download task may be in flight
+    // per folder: a blob whose providers are all unreachable takes as long as
+    // the connect timeouts allow, and reconcile runs far more often than that,
+    // so without the guard each pass stacked another copy of the same doomed
+    // downloads. And the loop only re-notifies when a download actually
+    // succeeded: a hash that keeps failing would otherwise notify → reconcile →
+    // still NeedsDownload → spawn → notify, spinning as fast as a doc walk
+    // takes, forever. Downloads that stay unreachable are retried by the 30s
+    // sweep instead, which is a rate the failure can't outrun.
     if !need_download.is_empty() {
         let peers: Vec<PublicKey> = state
             .peers
@@ -1055,22 +1071,39 @@ async fn reconcile_remote(state: &SyncState) -> Result<()> {
             .keys()
             .filter_map(|k| k.parse().ok())
             .collect();
-        if !peers.is_empty() {
+        let idle = state
+            .dl_inflight
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok();
+        if !peers.is_empty() && idle {
             tracing::debug!(
                 blobs = need_download.len(),
                 "re-triggering blob downloads after restart"
             );
-            let downloader = state.node.store.downloader(&state.node.endpoint);
+            // Shared, not per-pass: see `Node::downloader`.
+            let downloader = state.node.downloader.clone();
             let notify = state.reconcile_notify.clone();
+            let inflight = state.dl_inflight.clone();
             tokio::spawn(async move {
+                let mut got = 0u32;
                 for hash in need_download {
-                    if let Err(e) = downloader.download(hash, peers.clone()).await {
-                        tracing::warn!(error = ?e, "blob re-download failed");
+                    match downloader.download(hash, peers.clone()).await {
+                        Ok(()) => got += 1,
+                        Err(e) => tracing::warn!(error = ?e, "blob re-download failed"),
                     }
                 }
+                inflight.store(false, std::sync::atomic::Ordering::Release);
                 // Signal the main loop to run reconcile now that blobs may be
                 // present — avoids calling reconcile_remote here (non-Send).
-                notify.notify_one();
+                // Only when something landed, or this is a spin loop.
+                if got > 0 {
+                    notify.notify_one();
+                }
             });
         }
     }

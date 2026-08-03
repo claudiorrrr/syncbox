@@ -18,13 +18,13 @@ use syncbox_core::sync::{
     EchoGuard, LogHandle, NameMap, PeerMap, StatsHandle, StatusLine, SyncState,
 };
 use syncbox_core::{config, pair, peer, sync};
+#[cfg(target_os = "macos")]
+use tauri::ActivationPolicy;
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager, State,
 };
-#[cfg(target_os = "macos")]
-use tauri::ActivationPolicy;
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_dialog::DialogExt;
 use tokio::sync::{mpsc, watch, Mutex};
@@ -737,6 +737,7 @@ async fn maybe_start_folder(app: &AppHandle, idx: usize) -> Result<bool> {
         names,
         fp_cache: Default::default(),
         reconcile_notify: Arc::new(tokio::sync::Notify::new()),
+        dl_inflight: Default::default(),
     };
     let handle = tauri::async_runtime::spawn(async move {
         if let Err(e) = sync::run(st, rx).await {
