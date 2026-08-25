@@ -9,7 +9,7 @@ resolver = "2"
 members = ["crates/syncbox-core", "crates/syncbox-cli", "src-tauri"]
 
 [workspace.package]
-version = "0.4.13"
+version = "0.4.14"
 edition = "2021"
 rust-version = "1.77"
 
