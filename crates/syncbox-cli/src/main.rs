@@ -23,7 +23,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::{atomic::AtomicU32, Arc},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use syncbox_core::{
     config,
@@ -33,6 +33,20 @@ use syncbox_core::{
     sync::{self, SyncState},
 };
 use tokio::sync::{mpsc, watch, Mutex};
+
+/// GC loop tick for `syncbox gc` — short, but long enough that docs is up and
+/// the protect callback can answer before the first sweep.
+const GC_FORCED_INTERVAL: Duration = Duration::from_secs(5);
+/// How often `syncbox gc` re-measures the store.
+const GC_POLL: Duration = Duration::from_secs(1);
+/// Steady readings needed before the sweep is called done.
+const GC_SETTLE_POLLS: u32 = 4;
+/// Hard stop, however large the store.
+const GC_TIMEOUT: Duration = Duration::from_secs(900);
+/// Where iroh-blobs keeps blobs too big to inline into `blobs.db`.
+const BLOB_DATA_DIR: &str = "data";
+/// How long to let the endpoint wind down before `syncbox gc` quits anyway.
+const GC_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Parser)]
 #[command(
@@ -83,6 +97,11 @@ enum Cmd {
         /// Which folder, by path. Optional when only one is synced.
         folder: Option<PathBuf>,
     },
+    /// Sweep blob-store copies of files that no folder needs any more.
+    ///
+    /// The engine does this every 30 minutes anyway; this forces one now.
+    /// Stop `syncbox run` (and quit the app) first — the store is single-writer.
+    Gc,
 }
 
 #[tokio::main]
@@ -99,6 +118,7 @@ async fn main() -> Result<()> {
         Cmd::List => do_list().await,
         Cmd::Remove { folder } => do_remove(folder).await,
         Cmd::Dump { folder } => do_dump(folder).await,
+        Cmd::Gc => do_gc().await,
     }
 }
 
@@ -456,6 +476,95 @@ async fn do_dump(folder: Option<PathBuf>) -> Result<()> {
         files + tombs
     );
     Ok(())
+}
+
+/// Force one blob-store sweep and report what it freed.
+///
+/// There is no one-shot GC entry point in iroh-blobs 0.103 — GC is a loop that
+/// sleeps, then sweeps. So we start a node whose loop ticks in seconds instead
+/// of half an hour, watch the store on disk until it stops shrinking, and stop.
+async fn do_gc() -> Result<()> {
+    init_tracing();
+    let iroh_root = config::iroh_root()?;
+    let blobs_dir = iroh_root.join("blobs");
+
+    let before = dir_size(&blobs_dir);
+    println!("blob store: {}", human(before));
+
+    // Opening the store fails outright if another syncbox holds it, which is
+    // what we want — two writers on one redb is how stores get corrupted.
+    let node = Node::spawn_with_gc(&iroh_root, GC_FORCED_INTERVAL)
+        .await
+        .context("could not open the store — is `syncbox run` or the app still going?")?;
+
+    println!("sweeping...");
+    wait_until_settled(&blobs_dir.join(BLOB_DATA_DIR)).await;
+    let after = dir_size(&blobs_dir);
+
+    match before.checked_sub(after) {
+        Some(freed) if freed > 0 => println!("freed {} — now {}", human(freed), human(after)),
+        _ => println!("nothing to free"),
+    }
+
+    // The blob store is flushed by now, so a peer that won't let go of its
+    // connection must not keep a maintenance command alive.
+    let _ = tokio::time::timeout(GC_SHUTDOWN_GRACE, node.shutdown()).await;
+    std::process::exit(0);
+}
+
+/// Poll until `dir` holds steady, or we give up.
+///
+/// Watches `blobs/data` rather than the whole store: `blobs.db` is rewritten on
+/// every GC tick, so its size jitters and a steady reading never comes.
+///
+/// The first sweep can't happen before the GC interval elapses, so we always
+/// wait out one of those before trusting a steady reading.
+async fn wait_until_settled(dir: &Path) {
+    let start = std::time::Instant::now();
+    let mut last = dir_size(dir);
+    let mut steady = 0u32;
+
+    loop {
+        tokio::time::sleep(GC_POLL).await;
+        let now = dir_size(dir);
+
+        steady = if now == last { steady + 1 } else { 0 };
+        last = now;
+
+        let swept_once = start.elapsed() > GC_FORCED_INTERVAL + GC_POLL;
+        if (swept_once && steady >= GC_SETTLE_POLLS) || start.elapsed() > GC_TIMEOUT {
+            return;
+        }
+    }
+}
+
+/// Bytes held under `dir`, recursively. Unreadable entries count as zero.
+fn dir_size(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+
+    entries
+        .flatten()
+        .map(|e| match e.metadata() {
+            Ok(md) if md.is_dir() => dir_size(&e.path()),
+            Ok(md) => md.len(),
+            Err(_) => 0,
+        })
+        .sum()
+}
+
+fn human(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+
+    format!("{size:.1} {}", UNITS[unit])
 }
 
 // ---------- helpers ----------
