@@ -30,7 +30,7 @@ jobs:
       # check into a plain env var here.
       HAS_CERT: ${{ secrets.WINDOWS_PFX_BASE64 != '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
